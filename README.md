@@ -18,9 +18,13 @@ Built with Claude Sonnet 4.5
 - **Trade Totals**: Automatic calculation of "You Get" and "You Give" totals
 - **Quantity Display**: Show number of available cards on COMC (tooltip)
 
+![Card details](https://github.com/user-attachments/assets/f5f53f6a-3d9f-490d-9e59-64276752cc73)
+
 ### Trade Partner Information
 - **Last Seen**: Relative time since their last login
 - **Rating History**: Shows what rating they gave you in a closed trade (displays nothing if they didn't rate you)
+
+![Trade information](https://github.com/user-attachments/assets/fe6582df-6454-4a79-bc34-1193b0f552cc)
 
 ## Usage
 

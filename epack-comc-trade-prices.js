@@ -600,9 +600,7 @@
 
     // Build tooltip
     let fullTooltip = '';
-    if (quantity != null && quantity > 0) {
-      fullTooltip = `${quantity} available\n`;
-    }
+
     // Add transferability info to tooltip
     if (isPhysical && !isTransferable) {
       fullTooltip += 'Non-Transferable Physical Card\n';
