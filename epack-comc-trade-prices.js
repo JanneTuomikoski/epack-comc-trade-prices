@@ -448,6 +448,7 @@
     const sanitize = (s) => String(s || '')
       .replace(/[""]/g, '')     // drop double/typographic quotes only
       .replace(/[\u2018\u2019]/g, "'") // normalize smart single quotes to plain apostrophe
+      .replace(/&/g, '')        // drop ampersands
       .replace(/\s+/g, ' ')
       .trim();
 
