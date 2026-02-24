@@ -3,7 +3,7 @@
 // @namespace    epack-comc-trade-prices
 // @version      1.0.0
 // @description  Fetch COMC prices on demand using API data.
-// @match        https://www.upperdeckepack.com/Trading*
+// @match        https://www.upperdeckepack.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      comc.com
 // @connect      upperdeckepack.com
