@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ePack Trade COMC price check
 // @namespace    epack-comc-trade-prices
-// @version      1.0.0
+// @version      1.1.0
 // @description  Fetch COMC prices on demand using API data.
 // @match        https://www.upperdeckepack.com/*
 // @grant        GM_xmlhttpRequest
