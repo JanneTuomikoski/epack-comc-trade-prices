@@ -38,7 +38,8 @@
     SIDE_BTN_ITEMS: '.side-btn-items',
     PRICE_CHIP: '.epack-price-chip',
     PHYSICAL_INDICATOR: '.epack-physical-indicator',
-    PARTNER_INFO: '.epack-partner-info'
+    PARTNER_INFO: '.epack-partner-info',
+    TRADE_EDIT_BUTTONS: '.trade-edit-buttons'
   };
 
   // Time constants to count last login time
@@ -180,6 +181,29 @@
       return pathParts[detailsIndex + 1];
     }
     return null;
+  }
+
+  /**
+   * Check if the trade page is in edit/draft mode (counter trade or new draft).
+   * In edit mode, cards added by the user may not be in the API response yet.
+   * Uses container element IDs inside .trade-edit-buttons to determine mode:
+   *   Normal viewing: #accept-trade and #counter-trade containers present
+   *   Edit/draft: those containers absent (Submit Trade, Cancel, etc. instead)
+   * @returns {boolean} True if in edit/draft mode
+   */
+  function isInEditMode() {
+    const editButtons = document.querySelector(SELECTORS.TRADE_EDIT_BUTTONS);
+
+    if (editButtons) {
+      // Normal viewing mode has #accept-trade and #counter-trade container elements
+      const isViewing = !!editButtons.querySelector('#accept-trade') ||
+                        !!editButtons.querySelector('#counter-trade');
+      return !isViewing;
+    }
+
+    // .trade-edit-buttons not found — check if we're on a trade page at all
+    return !!document.querySelector(SELECTORS.TRADE_HEADER) ||
+           document.querySelectorAll(SELECTORS.CARD).length > 0;
   }
 
   /**
@@ -357,6 +381,55 @@
       isPhysical,
       isTransferable,
       cardId: apiCardData.templateId
+    };
+  }
+
+  /**
+   * Extract card metadata from DOM elements as fallback when API data is unavailable.
+   * Used in edit/draft mode for newly added cards not yet in the API response.
+   * Parses player name from .card-title and insert/number from .details span.
+   * @param {HTMLElement} cardEl - Card DOM element (.product-card-display)
+   * @returns {Object|null} Card metadata or null if extraction fails
+   */
+  function extractCardMetaFromDom(cardEl) {
+    const titleEl = cardEl.querySelector('.name.card-title') || cardEl.querySelector('.card-title');
+    const detailsEl = cardEl.querySelector('.details');
+
+    if (!titleEl || !detailsEl) return null;
+
+    const player = clean(titleEl.textContent);
+    const rawDetails = clean(detailsEl.textContent);
+
+    if (!player || !rawDetails) return null;
+
+    // Parse "InsertName, CardNumber" — split on last comma
+    const lastCommaIdx = rawDetails.lastIndexOf(',');
+    let insertName, number;
+
+    if (lastCommaIdx !== -1) {
+      insertName = clean(rawDetails.substring(0, lastCommaIdx));
+      number = clean(rawDetails.substring(lastCommaIdx + 1));
+    } else {
+      insertName = rawDetails;
+      number = '';
+    }
+
+    // Detect physical status from card-body class
+    const cardBody = cardEl.querySelector('.card-body');
+    const isPhysical = cardBody ? cardBody.classList.contains('is-physical') : false;
+
+    const query = buildQuery({ player, insertName, number });
+    const cardId = extractCardIdFromDom(cardEl);
+
+    return {
+      player,
+      insertName,
+      number,
+      query,
+      rawDetails,
+      isPhysical,
+      isTransferable: false, // Cannot determine from DOM, default to false
+      cardId
     };
   }
 
@@ -656,7 +729,16 @@
           if (!domCardId) return;
 
           const apiCardData = cardLookupMap.get(domCardId);
-          if (!apiCardData || !apiCardData.isPhysical) return;
+          let isPhysical = apiCardData?.isPhysical ?? false;
+          let isTransferable = apiCardData?.isTransferable ?? false;
+
+          // Fallback: check DOM for physical status in edit mode
+          if (!apiCardData && isInEditMode()) {
+            const cardBody = card.querySelector('.card-body');
+            isPhysical = cardBody ? cardBody.classList.contains('is-physical') : false;
+          }
+
+          if (!isPhysical) return;
 
           // Find side-btn-items container
           const sideBtnItems = card.querySelector(SELECTORS.SIDE_BTN_ITEMS);
@@ -670,7 +752,6 @@
           div.className = 'side-btn tooltip-right epack-physical-indicator';
 
           // Set tooltip based on transferability
-          const isTransferable = apiCardData.isTransferable;
           const tooltipText = isTransferable ? 'Physical Card' : 'Physical Card (NT)';
           div.setAttribute('data-tooltip', tooltipText);
 
@@ -736,10 +817,20 @@
           if (!domCardId) return;
 
           const apiCardData = cardLookupMap.get(domCardId);
-          if (!apiCardData) return;
+          let isPhysical;
+
+          if (apiCardData) {
+            isPhysical = apiCardData.isPhysical;
+          } else if (isInEditMode()) {
+            // Fallback: check DOM for physical status
+            const cardBody = card.querySelector('.card-body');
+            isPhysical = cardBody ? cardBody.classList.contains('is-physical') : null;
+          } else {
+            return;
+          }
 
           // Add CSS class for digital cards
-          if (apiCardData.isPhysical === false) {
+          if (isPhysical === false) {
             card.classList.add('epack-digital-card');
           } else {
             card.classList.remove('epack-digital-card');
@@ -809,6 +900,7 @@
     // Each visible card tile == 1 unit
     const cards = [...containerEl.querySelectorAll(SELECTORS.CARD)];
 
+    const editMode = isInEditMode();
     let sum = 0;
     let priced = 0;
     let digital = 0;
@@ -820,7 +912,15 @@
       // Check if card is digital
       const domCardId = extractCardIdFromDom(card);
       const apiCardData = domCardId ? cardLookupMap.get(domCardId) : null;
-      const isDigital = apiCardData && apiCardData.isPhysical === false;
+      let isDigital = false;
+
+      if (apiCardData) {
+        isDigital = apiCardData.isPhysical === false;
+      } else if (editMode) {
+        // Fallback: check DOM for physical status
+        const cardBody = card.querySelector('.card-body');
+        isDigital = cardBody ? !cardBody.classList.contains('is-physical') : false;
+      }
 
       if (isDigital) {
         digital += 1;
@@ -916,6 +1016,7 @@
       setStatus?.('Loading trade data...');
       const tradeData = await getTradeData();
       const cardLookupMap = await buildCardLookupMap(tradeData);
+      const editMode = isInEditMode();
 
       let idx = 0;
       for (const card of cards) {
@@ -927,13 +1028,20 @@
           return;
         }
 
-        // Try to get card ID from DOM and match with API data
         const domCardId = extractCardIdFromDom(card);
         const apiCardData = domCardId ? cardLookupMap.get(domCardId) : null;
 
-        const meta = extractCardMeta(apiCardData);
+        let meta = extractCardMeta(apiCardData);
         if (!meta || !meta.query) {
-          continue;
+          // Fallback: extract from DOM when in edit/draft mode (newly added cards)
+          if (editMode) {
+            meta = extractCardMetaFromDom(card);
+            if (!meta || !meta.query) {
+              continue;
+            }
+          } else {
+            continue;
+          }
         }
 
         setStatus?.(`(${++idx}/${cards.length}) ${meta.player}…`);
