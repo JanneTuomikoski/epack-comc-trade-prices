@@ -380,6 +380,7 @@
       .replace(/\bBase Set\b/gi, 'Base')           // "Base Set" → "Base"
       .replace(/\bUD\s+Series\s+\d+\b/g, 'Upper Deck')  // "UD Series 2" → "Upper Deck"
       .replace(/\bUD\b/g, 'Upper Deck')            // "UD" → "Upper Deck"
+      .replace(/\bOutburst Silver\b/g, 'Outburst') // "Outburst Silver" → "Outburst"
       .replace(/\bParallel\b/gi, '')               // Remove "Parallel"
       .replace(/\bTier\s+\d+\b/g, '')              // Remove "Tier 1", "Tier 2", etc.
       .replace(/\bOracles\s*-\s*SSP\b/gi, 'Oracles Rare')  // "Oracles - SSP" → "Oracles rare"
