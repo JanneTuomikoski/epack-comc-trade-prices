@@ -444,7 +444,8 @@
   function buildQuery({ player, insertName, number }) {
     // sanitize punctuation COMC tends to ignore
     const sanitize = (s) => String(s || '')
-      .replace(/[''"']/g, '')   // drop quotes/apostrophes
+      .replace(/[""]/g, '')     // drop double/typographic quotes only
+      .replace(/[\u2018\u2019]/g, "'") // normalize smart single quotes to plain apostrophe
       .replace(/\s+/g, ' ')
       .trim();
 
