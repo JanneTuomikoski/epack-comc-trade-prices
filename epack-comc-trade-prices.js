@@ -23,6 +23,8 @@
   const FADE_DIGITAL       = true;
   const FADE_OPACITY       = 0.3;
   const LOG                = '[ePack→COMC]';
+  const COMC_FEE           = 0.25;
+  const PREF_INCLUDE_FEE   = 'epack-comc-include-fee';
   const TOOLBAR_ID         = 'epack-comc-toolbar';
   const ANCHOR_ID          = `${TOOLBAR_ID}-anchor`;
   const TOTALS_ID          = `${TOOLBAR_ID}-totals`;
@@ -523,6 +525,37 @@
     }
   }
 
+  // ---------- Fee Toggle Preference ----------
+  /**
+   * Get user preference for including COMC fee in displayed prices.
+   * @returns {boolean} True if COMC fee should be included (default: true)
+   */
+  function getIncludeFee() {
+    try {
+      const val = localStorage.getItem(PREF_INCLUDE_FEE);
+      return val === null ? true : val === 'true';
+    } catch { return true; }
+  }
+
+  /**
+   * Save user preference for including COMC fee in displayed prices.
+   * @param {boolean} value - True to include fee, false to exclude
+   */
+  function setIncludeFee(value) {
+    try { localStorage.setItem(PREF_INCLUDE_FEE, String(value)); } catch {}
+  }
+
+  /**
+   * Adjust a raw COMC price based on the current fee toggle preference.
+   * @param {number|null} rawPrice - The original COMC price (includes fee)
+   * @returns {number|null} Adjusted price, or null if input is null
+   */
+  function getDisplayPrice(rawPrice) {
+    if (rawPrice == null) return null;
+    if (getIncludeFee()) return rawPrice;
+    return Math.max(0, rawPrice - COMC_FEE);
+  }
+
   /**
    * Clear all cached COMC data for current version.
    */
@@ -651,7 +684,7 @@
    * @param {number|null} [payload.quantity] - Available quantity
    */
   async function renderChip(cardEl, payload) {
-    const { text, title = '', link = null, isError = false, tooltip = '', isPhysical = null, isTransferable = null, quantity = null } = payload;
+    const { text, title = '', link = null, isError = false, tooltip = '', isPhysical = null, isTransferable = null, quantity = null, rawPrice = null } = payload;
     const footer = cardEl.querySelector('.card-footer') || cardEl;
     let chip = footer.querySelector(SELECTORS.PRICE_CHIP);
     if (!chip) {
@@ -665,8 +698,22 @@
       footer.appendChild(chip);
     }
 
-    // Build display text with digital indicator
+    // Store raw COMC price for fee toggle recalculation
+    if (rawPrice != null) {
+      chip.dataset.rawPrice = String(rawPrice);
+    } else {
+      delete chip.dataset.rawPrice;
+    }
+    if (isPhysical !== null) {
+      chip.dataset.isPhysical = String(isPhysical);
+    }
+
+    // Build display text — apply fee adjustment when a raw price is available
     let displayText = text;
+    if (rawPrice != null) {
+      const displayPrice = getDisplayPrice(rawPrice);
+      displayText = `COMC: $${displayPrice.toFixed(2)}`;
+    }
     if (isPhysical !== null) {
       displayText += isPhysical ? '' : ' 💿';
     }
@@ -703,6 +750,24 @@
       card.classList.remove('epack-digital-card');
     });
     await renderTotals(); // reset totals display immediately
+  }
+
+  /**
+   * Recalculate all displayed chip prices based on the current fee toggle,
+   * then update totals. Called when the user toggles the COMC fee preference.
+   */
+  async function refreshAllPrices() {
+    document.querySelectorAll(SELECTORS.PRICE_CHIP).forEach(chip => {
+      if (!chip.dataset.rawPrice) return;
+      const rawPrice = parseFloat(chip.dataset.rawPrice);
+      if (isNaN(rawPrice)) return;
+
+      const displayPrice = getDisplayPrice(rawPrice);
+      let text = `COMC: $${displayPrice.toFixed(2)}`;
+      if (chip.dataset.isPhysical === 'false') text += ' 💿';
+      chip.textContent = text;
+    });
+    await renderTotals();
   }
 
   /**
@@ -1071,7 +1136,8 @@
             tooltip: cached.tooltip || '',
             isPhysical: meta.isPhysical,
             isTransferable: meta.isTransferable,
-            quantity: cached.quantity ?? null
+            quantity: cached.quantity ?? null,
+            rawPrice: cached.price
           });
           await delay(DELAY_MS);
           continue;
@@ -1123,7 +1189,8 @@
           tooltip: tooltip,
           isPhysical: meta.isPhysical,
           isTransferable: meta.isTransferable,
-          quantity: final.quantity ?? null
+          quantity: final.quantity ?? null,
+          rawPrice: final.price
         });
 
         await delay(REQ_DELAY_MS + Math.random() * REQ_DELAY_RANDOM);
@@ -1198,7 +1265,51 @@
       marginLeft: '8px'
     });
 
-    wrapper.append(fetchBtn, refreshBtn, abortBtn, status);
+    // Fee toggle — reuses ePack's native .onoffswitch styling (persisted in localStorage)
+    const feeToggleWrap = document.createElement('div');
+    Object.assign(feeToggleWrap.style, {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '8px',
+      marginLeft: 'auto',
+      textAlign: 'right',
+      fontWeight: '600',
+      fontSize: '14px'
+    });
+
+    const feeLabelText = document.createElement('span');
+    feeLabelText.textContent = `Incl. COMC fee ($${COMC_FEE.toFixed(2)}/card)`;
+
+    const onoffDiv = document.createElement('div');
+    onoffDiv.className = 'onoffswitch';
+    onoffDiv.style.lineHeight = '1.5';
+    onoffDiv.style.top = '3px';
+
+    const onoffLabel = document.createElement('label');
+    onoffLabel.className = 'onoffswitch-label';
+
+    const feeCheckbox = document.createElement('input');
+    feeCheckbox.type = 'checkbox';
+    feeCheckbox.className = 'onoffswitch-checkbox';
+    feeCheckbox.checked = getIncludeFee();
+
+    const innerSpan = document.createElement('span');
+    innerSpan.className = 'onoffswitch-inner';
+
+    const switchSpan = document.createElement('span');
+    switchSpan.className = 'onoffswitch-switch';
+
+    onoffLabel.append(feeCheckbox, innerSpan, switchSpan);
+    onoffDiv.appendChild(onoffLabel);
+
+    feeToggleWrap.append(feeLabelText, onoffDiv);
+
+    feeCheckbox.onchange = () => {
+      setIncludeFee(feeCheckbox.checked);
+      refreshAllPrices();
+    };
+
+    wrapper.append(fetchBtn, refreshBtn, abortBtn, status, feeToggleWrap);
 
     // Button hover effects
     [fetchBtn, refreshBtn, abortBtn].forEach(btn => {
