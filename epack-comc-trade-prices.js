@@ -23,7 +23,7 @@
   const FADE_DIGITAL       = true;
   const FADE_OPACITY       = 0.3;
   const LOG                = '[ePack→COMC]';
-  const COMC_FEE           = 0.25;
+  const COMC_FEE           = 0.5;
   const PREF_INCLUDE_FEE   = 'epack-comc-include-fee';
   const TOOLBAR_ID         = 'epack-comc-toolbar';
   const ANCHOR_ID          = `${TOOLBAR_ID}-anchor`;

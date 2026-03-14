@@ -18,7 +18,7 @@ Built with Claude Sonnet 4.5
 - **Digital Card Fading**: Optional opacity styling for digital-only cards (configurable)
 - **Trade Totals**: Automatic calculation of "You Get" and "You Give" totals
 - **Quantity Display**: Show number of available cards on COMC (tooltip)
-- **COMC Fee Toggle**: Toolbar toggle to include or exclude the $0.25 COMC sales fee from all displayed prices — preference is persisted per-browser and prices update instantly without re-fetching
+- **COMC Fee Toggle**: Toolbar toggle to include or exclude the $0.50 COMC sales fee from all displayed prices — preference is persisted per-browser and prices update instantly without re-fetching
 
 ![Card details](https://github.com/user-attachments/assets/f5f53f6a-3d9f-490d-9e59-64276752cc73)
 
@@ -50,7 +50,7 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 - **Physical Cards Only**: Only physical cards have COMC prices (digital cards show "N/A")
 - **COMC Accuracy**: Prices are fetched from COMC search results (lowest non-auction listing)
 - **API Limits**: Respects rate limiting
-- **COMC Fee**: The $0.25/card sales fee toggle defaults to included. Toggling it instantly recalculates all currently displayed prices without a new network request
+- **COMC Fee**: The $0.50/card sales fee toggle defaults to included. Toggling it instantly recalculates all currently displayed prices without a new network request
 - **Edit/Draft Mode**: When creating a counter trade or editing a draft, card data not yet in the ePack API is extracted from the DOM — accuracy may be lower for these cards
 
 ## Known Limitations
