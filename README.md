@@ -4,7 +4,7 @@ A [Tampermonkey](https://www.tampermonkey.net/) userscript that integrates COMC 
 
 **⚠️ In early development phase, use with caution and always remember to check COMC results yourself if in doubt.**
 
-Built with Claude Sonnet 4.5
+Built with Claude Sonnet 4.6
 
 ## Features
 
@@ -28,18 +28,34 @@ Built with Claude Sonnet 4.5
 
 ![Trade information](https://github.com/user-attachments/assets/fe6582df-6454-4a79-bc34-1193b0f552cc)
 
+## Installation
+
+### Why a comc.com tab is required
+
+COMC uses Cloudflare bot protection that blocks direct requests from browser extensions (`GM_xmlhttpRequest` runs in an isolated context that Cloudflare reliably detects and returns 403). The only approach that bypasses this without a server-side proxy is to make requests from *within* a real comc.com browser tab, where they are same-origin and never challenged. This script handles that automatically — the same script instance running on comc.com acts as a background fetch worker for the ePack instance.
+
+### Setup
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/) in Chrome, Edge, or Firefox
+2. Click **[Install script](https://raw.githubusercontent.com/JanneTuomikoski/epack-comc-trade-prices/main/epack-comc-trade-prices.js)** (or paste the file contents into a new Tampermonkey script)
+3. Open a **comc.com** tab in your browser and leave it open in the background
+4. Navigate to any trade on [Upper Deck ePack](https://www.upperdeckepack.com)
+
+The toolbar will show **⚡ worker ✓** when the comc.com tab is detected. The comc.com tab just needs to stay open — you don't need to interact with it.
+
 ## Usage
 
 ### Basic Workflow
 
 1. **Navigate to a Trade**: Open any active or closed trade on ePack
-2. **Fetch Prices**: Click the "Fetch COMC Prices" button
-3. **Review Results**: Price info appears on each card with:
+2. **Open a comc.com tab**: Any comc.com page works — leave it in the background
+3. **Fetch Prices**: Click the "Fetch COMC Prices" button
+4. **Review Results**: Price info appears on each card with:
    - Current COMC price (clickable to view the COMC listing, or search page if no results are found)
    - Number of available cards on COMC
    - Digital/Physical/Non-transferable indicators
-4. **Check Totals**: Review the calculated totals for each side
-5. **Refresh**: Use "Refresh Prices" to clear cache and re-fetch
+5. **Check Totals**: Review the calculated totals for each side
+6. **Refresh**: Use "Refresh Prices" to clear cache and re-fetch
 
 ## Contributing
 
@@ -49,12 +65,13 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 
 - **Physical Cards Only**: Only physical cards have COMC prices (digital cards show "N/A")
 - **COMC Accuracy**: Prices are fetched from COMC search results (lowest non-auction listing)
-- **API Limits**: Respects rate limiting
+- **Caching**: Results are cached for 3 hours in localStorage to reduce requests
 - **COMC Fee**: The $0.50/card sales fee toggle defaults to included. Toggling it instantly recalculates all currently displayed prices without a new network request
 - **Edit/Draft Mode**: When creating a counter trade or editing a draft, card data not yet in the ePack API is extracted from the DOM — accuracy may be lower for these cards
 
 ## Known Limitations
 
+- Requires a comc.com tab to be open
 - Requires manual trigger (not automatic on page load)
 - Only searches ungraded cards on COMC
 - Relies on ePack's API structure (may break with updates)
