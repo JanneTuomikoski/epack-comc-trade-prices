@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         ePack Trade COMC price check
 // @namespace    epack-comc-trade-prices
-// @version      1.1.0
-// @description  Fetch COMC prices on demand using API data.
+// @version      1.8.0
+// @description  Fetch COMC prices via a comc.com worker tab. Keep one comc.com tab open — no proxy needed.
 // @match        https://www.upperdeckepack.com/*
+// @match        https://www.comc.com/*
 // @grant        GM_xmlhttpRequest
-// @connect      comc.com
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      upperdeckepack.com
 // @run-at       document-idle
 // ==/UserScript==
@@ -13,679 +16,377 @@
 (function () {
   'use strict';
 
+  // ============================================================
+  // COMC WORKER  (runs when this script is on a comc.com tab)
+  // All instances of this script share the same GM storage, so
+  // the worker and the ePack tab communicate transparently.
+  // ============================================================
+  if (location.hostname.includes('comc.com')) {
+    const LOG = '[COMC-Worker]';
+    let lastId = null;
+    console.info(LOG, 'active — polling for ePack price requests');
+    setInterval(async () => {
+      const raw = await GM_getValue('comc_req', null);
+      if (!raw) return;
+      let req;
+      try { req = JSON.parse(raw); } catch { return; }
+      const { id, url } = req;
+      if (!id || id === lastId) return;
+      lastId = id;
+      if (url === 'ping') {
+        await GM_setValue('comc_res_' + id, JSON.stringify({ ok: true, pong: true }));
+        return;
+      }
+      if (!url?.includes('comc.com')) return;
+      console.info(LOG, 'fetching', url);
+      try {
+        const resp = await fetch(url, {
+          credentials: 'include',
+          headers: { 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+        });
+        if (resp.ok) {
+          const html = await resp.text();
+          console.info(LOG, 'done', id, html.length, 'bytes');
+          await GM_setValue('comc_res_' + id, JSON.stringify({ ok: true, html }));
+        } else {
+          console.warn(LOG, 'HTTP', resp.status);
+          await GM_setValue('comc_res_' + id, JSON.stringify({ ok: false, status: resp.status }));
+        }
+      } catch (e) {
+        console.error(LOG, e.message);
+        await GM_setValue('comc_res_' + id, JSON.stringify({ ok: false, error: e.message }));
+      }
+    }, 500);
+    return; // don't run ePack UI on comc.com
+  }
+
+  // ============================================================
+  // ePACK UI  (runs on upperdeckepack.com)
+  // ============================================================
+
   // ---------- Config ----------
-  const REQ_DELAY_MS       = 1000;
-  const REQ_DELAY_RANDOM   = 500;
-  const DELAY_MS           = 250;
-  const TOOLBAR_CHECK_MS   = 2000;
-  const CACHE_TTL_MS       = 3 * 60 * 60 * 1000; // 3h
-  const CACHE_VERSION      = 'v10';
-  const FADE_DIGITAL       = true;
-  const FADE_OPACITY       = 0.3;
-  const LOG                = '[ePack→COMC]';
-  const COMC_FEE           = 0.5;
-  const PREF_INCLUDE_FEE   = 'epack-comc-include-fee';
-  const TOOLBAR_ID         = 'epack-comc-toolbar';
-  const ANCHOR_ID          = `${TOOLBAR_ID}-anchor`;
-  const TOTALS_ID          = `${TOOLBAR_ID}-totals`;
+  const REQ_DELAY_MS     = 1500;
+  const REQ_DELAY_RANDOM = 800;
+  const DELAY_MS         = 250;
+  const TOOLBAR_CHECK_MS = 2000;
+  const CACHE_TTL_MS     = 3 * 60 * 60 * 1000;
+  const CACHE_VERSION    = 'v13';
+  const FADE_DIGITAL     = true;
+  const FADE_OPACITY     = 0.3;
+  const LOG              = '[ePack→COMC]';
+  const COMC_FEE         = 0.5;
+  const PREF_INCLUDE_FEE = 'epack-comc-include-fee';
+  const TOOLBAR_ID       = 'epack-comc-toolbar';
+  const ANCHOR_ID        = `${TOOLBAR_ID}-anchor`;
+  const TOTALS_ID        = `${TOOLBAR_ID}-totals`;
+  const WORKER_TIMEOUT   = 30000;  // ms to wait for worker response
 
-  // DOM Selectors
   const SELECTORS = {
-    TOOLBAR: `#${TOOLBAR_ID}`,
-    CARD: '.trade-card .product-card-display',
+    TOOLBAR:           `#${TOOLBAR_ID}`,
+    CARD:              '.trade-card .product-card-display',
     PARTNER_CONTAINER: '.collection-owner-container .user-info',
-    PARTNER_USERNAME: '.collection-owner-container .user-info a.username',
-    TRADE_HEADER: '.page-section.container-fluid.action-bar.collection-header.trade-detail-header.desktop-only',
-    TRADE_SIDES: '.trade-detail.row .trade-side.col-sm-6',
-    SIDE_BTN_ITEMS: '.side-btn-items',
-    PRICE_CHIP: '.epack-price-chip',
-    PHYSICAL_INDICATOR: '.epack-physical-indicator',
-    PARTNER_INFO: '.epack-partner-info',
-    TRADE_EDIT_BUTTONS: '.trade-edit-buttons'
+    PARTNER_USERNAME:  '.collection-owner-container .user-info a.username',
+    TRADE_HEADER:      '.page-section.container-fluid.action-bar.collection-header.trade-detail-header.desktop-only',
+    TRADE_SIDES:       '.trade-detail.row .trade-side.col-sm-6',
+    SIDE_BTN_ITEMS:    '.side-btn-items',
+    PRICE_CHIP:        '.epack-price-chip',
+    PHYSICAL_INDICATOR:'.epack-physical-indicator',
+    PARTNER_INFO:      '.epack-partner-info',
+    TRADE_EDIT_BUTTONS:'.trade-edit-buttons',
   };
 
-  // Time constants to count last login time
   const TIME = {
-    SECOND: 1000,
     MINUTE: 60 * 1000,
-    HOUR: 60 * 60 * 1000,
-    DAY: 24 * 60 * 60 * 1000,
-    WEEK: 7 * 24 * 60 * 60 * 1000,
-    MONTH: 30 * 24 * 60 * 60 * 1000,
-    YEAR: 365 * 24 * 60 * 60 * 1000
+    HOUR:   60 * 60 * 1000,
+    DAY:    24 * 60 * 60 * 1000,
+    WEEK:   7  * 24 * 60 * 60 * 1000,
+    MONTH:  30 * 24 * 60 * 60 * 1000,
+    YEAR:   365 * 24 * 60 * 60 * 1000,
   };
 
-  // ---------- State Management ----------
+  // ---------- State ----------
   const state = {
-    cachedTradeData: null,
-    toolbarMounted: false,
-    partnerInfoInjected: false,
-    isCheckingToolbar: false,
-    isCheckingPartnerInfo: false,
-    isFetching: false,
-    shouldAbort: false,
-    pollingInterval: null,
-    mutationObserver: null
+    cachedTradeData:        null,
+    toolbarMounted:         false,
+    partnerInfoInjected:    false,
+    isCheckingToolbar:      false,
+    isCheckingPartnerInfo:  false,
+    isFetching:             false,
+    shouldAbort:            false,
+    pollingInterval:        null,
+    mutationObserver:       null,
   };
+
+  // Worker liveness — checked once on toolbar mount, re-checked on Refresh
+  const worker = { checked: false, alive: false };
 
   // ---------- Utilities ----------
-  /**
-   * Clean and normalize whitespace in a string.
-   * @param {string} s - String to clean
-   * @returns {string} Cleaned string
-   */
   const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
-
-  /**
-   * Delay execution for specified milliseconds.
-   * @param {number} ms - Milliseconds to delay
-   * @returns {Promise<void>}
-   */
   const delay = ms => new Promise(r => setTimeout(r, ms));
+  const now   = () => Date.now();
 
-  /**
-   * Get current timestamp.
-   * @returns {number} Current timestamp in milliseconds
-   */
-  const now = () => Date.now();
-
-  /**
-   * Format date as relative time (e.g., "2 hours ago", "3 days ago").
-   * @param {string} dateString - ISO date string to format
-   * @returns {string} Formatted relative time string
-   */
   function formatRelativeTime(dateString) {
     if (!dateString || dateString === '0001-01-01T00:00:00') return 'Unknown';
+    let s = dateString;
+    if (!s.endsWith('Z') && !s.includes('+') && !s.includes('T00:00:00.000')) s += 'Z';
+    const diff = new Date() - new Date(s);
+    if (diff < TIME.MINUTE) return 'Just now';
+    const m = Math.floor(diff / TIME.MINUTE);   if (m  < 60) return `${m} minute${m!==1?'s':''} ago`;
+    const h = Math.floor(diff / TIME.HOUR);     if (h  < 24) return `${h} hour${h!==1?'s':''} ago`;
+    const d = Math.floor(diff / TIME.DAY);      if (d  <  7) return `${d} day${d!==1?'s':''} ago`;
+    const w = Math.floor(diff / TIME.WEEK);     if (w  <  4) return `${w} week${w!==1?'s':''} ago`;
+    const mo = Math.floor(diff / TIME.MONTH);   if (mo < 12) return `${mo} month${mo!==1?'s':''} ago`;
+    const y = Math.floor(diff / TIME.YEAR);     return `${y} year${y!==1?'s':''} ago`;
+  }
 
-    // API returns UTC timestamps - ensure they're parsed as UTC by adding 'Z' if not present
-    let utcDateString = dateString;
-    if (!dateString.endsWith('Z') && !dateString.includes('+') && !dateString.includes('T00:00:00.000')) {
-      utcDateString = dateString + 'Z';
+  function formatRatingStars(r) {
+    if (!r) return '';
+    return '★'.repeat(r) + '☆'.repeat(5 - r);
+  }
+
+  // ---------- Worker health check ----------
+  async function checkWorker() {
+    // Send a ping through the same comc_req channel the worker polls.
+    const id = `ping_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await GM_setValue('comc_req', JSON.stringify({ id, url: 'ping' }));
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      await delay(300);
+      const raw = await GM_getValue('comc_res_' + id, null);
+      if (raw != null) {
+        await GM_deleteValue('comc_res_' + id);
+        return true;
+      }
     }
-
-    const date = new Date(utcDateString);
-    const nowDate = new Date();
-    const diffMs = nowDate - date;
-
-    if (diffMs < TIME.MINUTE) return 'Just now';
-
-    const diffMin = Math.floor(diffMs / TIME.MINUTE);
-    if (diffMin < 60) return `${diffMin} minute${diffMin !== 1 ? 's' : ''} ago`;
-
-    const diffHr = Math.floor(diffMs / TIME.HOUR);
-    if (diffHr < 24) return `${diffHr} hour${diffHr !== 1 ? 's' : ''} ago`;
-
-    const diffDay = Math.floor(diffMs / TIME.DAY);
-    if (diffDay < 7) return `${diffDay} day${diffDay !== 1 ? 's' : ''} ago`;
-
-    const diffWeek = Math.floor(diffMs / TIME.WEEK);
-    if (diffWeek < 4) return `${diffWeek} week${diffWeek !== 1 ? 's' : ''} ago`;
-
-    const diffMonth = Math.floor(diffMs / TIME.MONTH);
-    if (diffMonth < 12) return `${diffMonth} month${diffMonth !== 1 ? 's' : ''} ago`;
-
-    const diffYear = Math.floor(diffMs / TIME.YEAR);
-    return `${diffYear} year${diffYear !== 1 ? 's' : ''} ago`;
+    return false;
   }
 
-  /**
-   * Format rating as stars (1-5 scale).
-   * @param {number} rating - Rating value (0-5)
-   * @returns {string} Star representation (★☆)
-   */
-  function formatRatingStars(rating) {
-    if (!rating || rating === 0) return '';
-    const fullStars = '★'.repeat(rating);
-    const emptyStars = '☆'.repeat(5 - rating);
-    return fullStars + emptyStars;
+  async function ensureWorkerChecked() {
+    if (worker.checked) return;
+    worker.alive   = await checkWorker();
+    worker.checked = true;
+    console.info(LOG, 'Worker', worker.alive ? 'online ✓' : 'OFFLINE ✗');
   }
 
-  // ---------- API Integration ----------
-  /**
-   * Extract trade partner's username from the visible "Trading With" section.
-   * Prioritizes href attribute over text content for reliability.
-   * @returns {string|null} The username or null if not found
-   */
+  // ---------- ePack API ----------
   function getTradePartnerUsername() {
-    // The element has structure: <a class="username" href="/Profile/JFRules">...</a>
-    const usernameLink = document.querySelector(SELECTORS.PARTNER_USERNAME);
-
-    if (usernameLink) {
-      // First try to extract from href attribute (most reliable)
-      const href = usernameLink.getAttribute('href');
-      if (href && href.startsWith('/Profile/')) {
-        const username = href.replace('/Profile/', '');
-        return username;
-      }
-
-      // Fallback: extract text, filtering out accessibility span content
-      let textContent = usernameLink.textContent || '';
-      // Remove the "account - " prefix from accessibility span
-      textContent = textContent.replace(/^account\s*-\s*/i, '');
-      const username = clean(textContent);
-
-      if (username) {
-        return username;
-      }
-    }
-
-    return null;
+    const a = document.querySelector(SELECTORS.PARTNER_USERNAME);
+    if (!a) return null;
+    const href = a.getAttribute('href') || '';
+    if (href.startsWith('/Profile/')) return href.replace('/Profile/', '');
+    return clean((a.textContent || '').replace(/^account\s*-\s*/i, '')) || null;
   }
 
-  /**
-   * Extract trade ID from current URL path.
-   * @returns {string|null} Trade ID or null if not found
-   */
   function extractTradeIdFromUrl() {
-    const pathParts = window.location.pathname.split('/');
-    const detailsIndex = pathParts.indexOf('Details');
-    if (detailsIndex !== -1 && pathParts.length > detailsIndex + 1) {
-      return pathParts[detailsIndex + 1];
-    }
-    return null;
+    const parts = window.location.pathname.split('/');
+    const i = parts.indexOf('Details');
+    return (i !== -1 && parts.length > i + 1) ? parts[i + 1] : null;
   }
 
-  /**
-   * Check if the trade page is in edit/draft mode (counter trade or new draft).
-   * In edit mode, cards added by the user may not be in the API response yet.
-   * Uses container element IDs inside .trade-edit-buttons to determine mode:
-   *   Normal viewing: #accept-trade and #counter-trade containers present
-   *   Edit/draft: those containers absent (Submit Trade, Cancel, etc. instead)
-   * @returns {boolean} True if in edit/draft mode
-   */
   function isInEditMode() {
-    const editButtons = document.querySelector(SELECTORS.TRADE_EDIT_BUTTONS);
-
-    if (editButtons) {
-      // Normal viewing mode has #accept-trade and #counter-trade container elements
-      const isViewing = !!editButtons.querySelector('#accept-trade') ||
-                        !!editButtons.querySelector('#counter-trade');
-      return !isViewing;
-    }
-
-    // .trade-edit-buttons not found — check if we're on a trade page at all
+    const eb = document.querySelector(SELECTORS.TRADE_EDIT_BUTTONS);
+    if (eb) return !(eb.querySelector('#accept-trade') || eb.querySelector('#counter-trade'));
     return !!document.querySelector(SELECTORS.TRADE_HEADER) ||
            document.querySelectorAll(SELECTORS.CARD).length > 0;
   }
 
-  /**
-   * Fetch trade data from ePack API.
-   * @param {string} tradeId - Trade ID to fetch
-   * @returns {Promise<Object>} Promise resolving to API response
-   */
   function fetchTradeApi(tradeId) {
-    const url = `https://www.upperdeckepack.com/api/Trading/ViewTrade?id=${tradeId}&forceLoad=false`;
-    return new Promise((resolve) => {
+    return new Promise(resolve => {
       GM_xmlhttpRequest({
         method: 'GET',
-        url: url,
-        onload: (resp) => {
-          if (resp.status >= 200 && resp.status < 300) {
-            try {
-              const data = JSON.parse(resp.responseText);
-              resolve({ ok: true, data });
-            } catch (e) {
-              resolve({ ok: false, error: 'Failed to parse JSON', details: e.message });
-            }
-          } else {
-            resolve({ ok: false, status: resp.status });
-          }
+        url: `https://www.upperdeckepack.com/api/Trading/ViewTrade?id=${tradeId}&forceLoad=false`,
+        onload: r => {
+          if (r.status >= 200 && r.status < 300) {
+            try   { resolve({ ok: true,  data: JSON.parse(r.responseText) }); }
+            catch { resolve({ ok: false, error: 'JSON parse failed' }); }
+          } else { resolve({ ok: false, status: r.status }); }
         },
-        onerror: (e) => resolve({ ok: false, error: e?.error || 'network error' })
+        onerror: e => resolve({ ok: false, error: e?.error || 'network error' }),
       });
     });
   }
 
-  /**
-   * Fetch trade data from ePack API, with caching.
-   * @returns {Promise<Object|null>} Trade data object or null on error
-   */
   async function getTradeData() {
-    // Return cached data if available
     if (state.cachedTradeData) return state.cachedTradeData;
-
-    const tradeId = extractTradeIdFromUrl();
-    if (!tradeId) {
-      console.warn(LOG, 'No trade ID found in URL');
-      return null;
-    }
-
-    const resp = await fetchTradeApi(tradeId);
-    if (!resp.ok) {
-      console.error(LOG, 'Failed to fetch trade API:', resp);
-      return null;
-    }
-
-    state.cachedTradeData = resp.data;
-    return resp.data;
+    const id = extractTradeIdFromUrl();
+    if (!id) return null;
+    const r = await fetchTradeApi(id);
+    if (!r.ok) { console.error(LOG, 'Trade API failed:', r); return null; }
+    state.cachedTradeData = r.data;
+    return r.data;
   }
 
-  /**
-   * Helper function to add a card to the lookup map
-   * @param {Map} map - The map to add to
-   * @param {Object} cardWrapper - Card data from API
-   * @param {string} side - 'give' or 'get'
-   */
-  function addCardToMap(map, cardWrapper, side) {
-    const templateId = cardWrapper.CardTemplate?.CardTemplateID;
-
-    if (!templateId) return;
-
-    const cardData = {
-      templateId: templateId,
-      side: side,
-      playerName: cardWrapper.CardTemplate?.PlayerName,
-      insertName: cardWrapper.CardTemplate?.InsertName,
-      cardNumber: cardWrapper.CardTemplate?.CardNumber,
-      isPhysical: cardWrapper.CardTemplate?.IsPhysical ?? false,
-      isTransferable: cardWrapper.CardTemplate?.IsTransferable ?? false,
-    };
-
-    map.set(templateId, cardData);
+  function addCardToMap(map, wrap, side) {
+    const id = wrap.CardTemplate?.CardTemplateID;
+    if (!id) return;
+    map.set(id, {
+      templateId: id, side,
+      playerName:     wrap.CardTemplate?.PlayerName,
+      insertName:     wrap.CardTemplate?.InsertName,
+      cardNumber:     wrap.CardTemplate?.CardNumber,
+      isPhysical:     wrap.CardTemplate?.IsPhysical    ?? false,
+      isTransferable: wrap.CardTemplate?.IsTransferable ?? false,
+    });
   }
 
-  /**
-   * Build a lookup map from card IDs to card data from API.
-   * Determines user role (Initiator/Counterparty) and maps cards to 'give'/'get' sides.
-   * Includes retry logic for extracting partner username.
-   * @param {Object} tradeData - Trade data from API
-   * @returns {Promise<Map>} Map of card IDs to card metadata
-   */
   async function buildCardLookupMap(tradeData) {
     if (!tradeData) return new Map();
-
     const map = new Map();
+    let partner = getTradePartnerUsername();
+    if (!partner) { await delay(500);  partner = getTradePartnerUsername(); }
+    if (!partner) { await delay(1000); partner = getTradePartnerUsername(); }
 
-    // Try to get partner username, with retries if needed
-    let partnerUsername = getTradePartnerUsername();
+    const pIsInit = partner && tradeData.Initiator?.UserName?.toLowerCase()    === partner.toLowerCase();
+    const pIsCp   = partner && tradeData.Counterparty?.UserName?.toLowerCase() === partner.toLowerCase();
 
-    // If username not found, wait a bit for DOM to settle and retry
-    if (!partnerUsername) {
-      await delay(500);
-      partnerUsername = getTradePartnerUsername();
-
-      if (!partnerUsername) {
-        // Try one more time after a longer delay
-        await delay(1000);
-        partnerUsername = getTradePartnerUsername();
-      }
-    }
-
-    // Determine current user's role by process of elimination
-    // If partner matches Initiator, we must be Counterparty (and vice versa)
-    const partnerIsInitiator = partnerUsername && tradeData.Initiator?.UserName?.toLowerCase() === partnerUsername.toLowerCase();
-    const partnerIsCounterparty = partnerUsername && tradeData.Counterparty?.UserName?.toLowerCase() === partnerUsername.toLowerCase();
-
-    const isInitiator = partnerIsCounterparty; // If partner is counterparty, we are initiator
-    const isCounterparty = partnerIsInitiator; // If partner is initiator, we are counterparty
-
-    // In the UI, current user's cards are always on the left (YOU GIVE)
-    // and other user's cards are on the right (YOU GET)
-    // So we need to map correctly based on the user's role
-
-    // Process InitiatorCards
-    if (tradeData.InitiatorCards && Array.isArray(tradeData.InitiatorCards)) {
-      // If current user is Initiator, these are YOUR cards (give)
-      // If current user is Counterparty, these are OTHER's cards (get)
-      const side = isInitiator ? 'give' : 'get';
-      tradeData.InitiatorCards.forEach(cardWrapper => addCardToMap(map, cardWrapper, side));
-    }
-
-    // Process CounterpartyCards
-    if (tradeData.CounterpartyCards && Array.isArray(tradeData.CounterpartyCards)) {
-      // If current user is Counterparty, these are YOUR cards (give)
-      // If current user is Initiator, these are OTHER's cards (get)
-      const side = isCounterparty ? 'give' : 'get';
-      tradeData.CounterpartyCards.forEach(cardWrapper => addCardToMap(map, cardWrapper, side));
-    }
-
+    (tradeData.InitiatorCards    || []).forEach(c => addCardToMap(map, c, pIsCp   ? 'give' : 'get'));
+    (tradeData.CounterpartyCards || []).forEach(c => addCardToMap(map, c, pIsInit ? 'give' : 'get'));
     return map;
   }
 
-  // ---------- Build COMC search query from ePack tile ----------
-  /**
-   * Extract card ID (UUID) from DOM element.
-   * @param {HTMLElement} cardEl - Card element to extract ID from
-   * @returns {string|null} Card template ID or null if not found
-   */
-  function extractCardIdFromDom(cardEl) {
-    // data-card-template attribute should always contain the CardTemplateID
-    return cardEl.getAttribute('data-card-template') || null;
+  // ---------- Card metadata ----------
+  function extractCardIdFromDom(el) { return el.getAttribute('data-card-template') || null; }
+
+  function extractCardMeta(api) {
+    if (!api?.playerName || !api?.insertName || !api?.cardNumber) return null;
+    const player = clean(api.playerName), insertName = clean(api.insertName), number = clean(api.cardNumber);
+    return { player, insertName, number, query: buildQuery({ player, insertName, number }),
+             rawDetails: `${insertName}, ${number}`, isPhysical: api.isPhysical ?? false,
+             isTransferable: api.isTransferable ?? false, cardId: api.templateId };
   }
 
-  /**
-   * Extract card metadata from API data.
-   * @param {Object|null} apiCardData - Card data from API
-   * @returns {Object|null} Card metadata or null if data unavailable
-   */
-  function extractCardMeta(apiCardData = null) {
-    // Use API data only - no HTML parsing fallback
-    if (!apiCardData || !apiCardData.playerName || !apiCardData.insertName || !apiCardData.cardNumber) {
-      console.warn(LOG, 'No API data available for card, skipping');
-      return null;
-    }
-
-    const player = clean(apiCardData.playerName);
-    const insertName = clean(apiCardData.insertName);
-    const number = clean(apiCardData.cardNumber);
-    const isPhysical = apiCardData.isPhysical ?? false;
-    const isTransferable = apiCardData.isTransferable ?? false;
-
-    // Build query from API data
-    const query = buildQuery({ player, insertName, number });
-
-    return {
-      player,
-      insertName: insertName,
-      number,
-      query,
-      rawDetails: `${insertName}, ${number}`,
-      isPhysical,
-      isTransferable,
-      cardId: apiCardData.templateId
-    };
-  }
-
-  /**
-   * Extract card metadata from DOM elements as fallback when API data is unavailable.
-   * Used in edit/draft mode for newly added cards not yet in the API response.
-   * Parses player name from .card-title and insert/number from .details span.
-   * @param {HTMLElement} cardEl - Card DOM element (.product-card-display)
-   * @returns {Object|null} Card metadata or null if extraction fails
-   */
-  function extractCardMetaFromDom(cardEl) {
-    const titleEl = cardEl.querySelector('.name.card-title') || cardEl.querySelector('.card-title');
-    const detailsEl = cardEl.querySelector('.details');
-
+  function extractCardMetaFromDom(el) {
+    const titleEl   = el.querySelector('.name.card-title') || el.querySelector('.card-title');
+    const detailsEl = el.querySelector('.details');
     if (!titleEl || !detailsEl) return null;
-
-    const player = clean(titleEl.textContent);
-    const rawDetails = clean(detailsEl.textContent);
-
-    if (!player || !rawDetails) return null;
-
-    // Parse "InsertName, CardNumber" — split on last comma
-    const lastCommaIdx = rawDetails.lastIndexOf(',');
-    let insertName, number;
-
-    if (lastCommaIdx !== -1) {
-      insertName = clean(rawDetails.substring(0, lastCommaIdx));
-      number = clean(rawDetails.substring(lastCommaIdx + 1));
-    } else {
-      insertName = rawDetails;
-      number = '';
-    }
-
-    // Detect physical status from card-body class
-    const cardBody = cardEl.querySelector('.card-body');
-    const isPhysical = cardBody ? cardBody.classList.contains('is-physical') : false;
-
-    const query = buildQuery({ player, insertName, number });
-    const cardId = extractCardIdFromDom(cardEl);
-
-    return {
-      player,
-      insertName,
-      number,
-      query,
-      rawDetails,
-      isPhysical,
-      isTransferable: false, // Cannot determine from DOM, default to false
-      cardId
-    };
+    const player = clean(titleEl.textContent), raw = clean(detailsEl.textContent);
+    if (!player || !raw) return null;
+    const ci = raw.lastIndexOf(',');
+    const insertName = ci !== -1 ? clean(raw.substring(0, ci)) : raw;
+    const number     = ci !== -1 ? clean(raw.substring(ci + 1)) : '';
+    const isPhysical = el.querySelector('.card-body')?.classList.contains('is-physical') ?? false;
+    return { player, insertName, number, query: buildQuery({ player, insertName, number }),
+             rawDetails: raw, isPhysical, isTransferable: false, cardId: extractCardIdFromDom(el) };
   }
 
-  /**
-   * Build COMC search query from card metadata.
-   * @param {Object} params - Query parameters
-   * @param {string} params.player - Player name
-   * @param {string} params.insertName - Insert/set name
-   * @param {string} params.number - Card number
-   * @returns {string} Formatted search query
-   */
   function buildQuery({ player, insertName, number }) {
-    // sanitize punctuation COMC tends to ignore
-    const sanitize = (s) => String(s || '')
-      .replace(/[""]/g, '')     // drop double/typographic quotes only
-      .replace(/[\u2018\u2019]/g, "'") // normalize smart single quotes to plain apostrophe
-      .replace(/&/g, '')        // drop ampersands
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Clean up set names for better COMC matching
-    const cleanSetName = (s) => String(s || '')
-      .replace(/\bBase Set\b/gi, 'Base')           // "Base Set" → "Base"
-      .replace(/\bUD\s+Series\s+\d+\b/g, 'Upper Deck')  // "UD Series 2" → "Upper Deck"
-      .replace(/\bUD\b/g, 'Upper Deck')            // "UD" → "Upper Deck"
-      .replace(/\bOutburst Silver\b/g, 'Outburst') // "Outburst Silver" → "Outburst"
-      .replace(/\bParallel\b/gi, '')               // Remove "Parallel"
-      .replace(/\bTier\s+\d+\b/g, '')              // Remove "Tier 1", "Tier 2", etc.
-      .replace(/\bOracles\s*-\s*SSP\b/gi, 'Oracles Rare')  // "Oracles - SSP" → "Oracles rare"
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    // Clean player name and handle special cases
-    const cleanPlayerName = (s) => {
-      let cleaned = sanitize(s);
-      // Replace "CL" at the end with "Checklist"
-      cleaned = cleaned.replace(/\s+CL$/i, ' Checklist');
-      return cleaned;
-    };
-
-    // Skip card number for certain insert types (e.g., Young Guns Renewed)
-    const skipNumber = /Young Guns Renewed/i.test(insertName);
-
-    const parts = [
-      cleanPlayerName(player),
-      cleanSetName(sanitize(insertName)),
-      skipNumber ? '' : String(number || '').replace(/^#/, ''),
-    ].filter(Boolean);
-
-    return parts.join(' ').trim();
+    const san = s => String(s||'').replace(/[""]/g,'').replace(/[\u2018\u2019]/g,"'")
+                      .replace(/&/g,'').replace(/\s+/g,' ').trim();
+    const cleanSet = s => String(s||'')
+      .replace(/\bBase Set\b/gi,'Base').replace(/\bUD\s+Series\s+\d+\b/g,'Upper Deck')
+      .replace(/\bUD\b/g,'Upper Deck').replace(/\bOutburst Silver\b/g,'Outburst')
+      .replace(/\bParallel\b/gi,'').replace(/\bTier\s+\d+\b/g,'')
+      .replace(/\bOracles\s*-\s*SSP\b/gi,'Oracles Rare').replace(/\s+/g,' ').trim();
+    const cleanPlayer = s => san(s).replace(/\s+CL$/i,' Checklist');
+    const skipNum = /Young Guns Renewed/i.test(insertName);
+    return [cleanPlayer(player), cleanSet(san(insertName)),
+            skipNum ? '' : String(number||'').replace(/^#/,'')]
+      .filter(Boolean).join(' ').trim();
   }
 
   // ---------- Cache ----------
-  /**
-   * Generate cache key for query.
-   * @param {string} q - Query string
-   * @returns {string} Cache key
-   */
-  function key(q) { return `comc:${CACHE_VERSION}:${q.toLowerCase()}`; }
+  const cacheKey = q => `comc:${CACHE_VERSION}:${q.toLowerCase()}`;
 
-  /**
-   * Get cached data for query.
-   * @param {string} q - Query string
-   * @returns {Object|null} Cached data or null if expired/missing
-   */
   function getCached(q) {
     try {
-      const raw = localStorage.getItem(key(q));
+      const raw = localStorage.getItem(cacheKey(q));
       if (!raw) return null;
       const obj = JSON.parse(raw);
-      if (now() - obj.ts > (obj.ttl || CACHE_TTL_MS)) {
-        localStorage.removeItem(key(q));
-        return null;
-      }
+      if (now() - obj.ts > (obj.ttl || CACHE_TTL_MS)) { localStorage.removeItem(cacheKey(q)); return null; }
       return obj.data;
-    } catch (e) {
-      console.warn(LOG, 'Cache read error:', e.message);
-      return null;
-    }
+    } catch { return null; }
   }
 
-  /**
-   * Store data in cache for query.
-   * @param {string} q - Query string
-   * @param {Object} data - Data to cache
-   */
   function setCached(q, data) {
-    try {
-      localStorage.setItem(key(q), JSON.stringify({ ts: now(), ttl: CACHE_TTL_MS, data }));
-    } catch (e) {
-      console.warn(LOG, 'Cache write error:', e.message);
-    }
+    try { localStorage.setItem(cacheKey(q), JSON.stringify({ ts: now(), ttl: CACHE_TTL_MS, data })); }
+    catch {}
   }
 
-  // ---------- Fee Toggle Preference ----------
-  /**
-   * Get user preference for including COMC fee in displayed prices.
-   * @returns {boolean} True if COMC fee should be included (default: true)
-   */
-  function getIncludeFee() {
-    try {
-      const val = localStorage.getItem(PREF_INCLUDE_FEE);
-      return val === null ? true : val === 'true';
-    } catch { return true; }
-  }
-
-  /**
-   * Save user preference for including COMC fee in displayed prices.
-   * @param {boolean} value - True to include fee, false to exclude
-   */
-  function setIncludeFee(value) {
-    try { localStorage.setItem(PREF_INCLUDE_FEE, String(value)); } catch {}
-  }
-
-  /**
-   * Adjust a raw COMC price based on the current fee toggle preference.
-   * @param {number|null} rawPrice - The original COMC price (includes fee)
-   * @returns {number|null} Adjusted price, or null if input is null
-   */
-  function getDisplayPrice(rawPrice) {
-    if (rawPrice == null) return null;
-    if (getIncludeFee()) return rawPrice;
-    return Math.max(0, rawPrice - COMC_FEE);
-  }
-
-  /**
-   * Clear all cached COMC data for current version.
-   */
   function clearCache() {
     const prefix = `comc:${CACHE_VERSION}:`;
-    const keysToRemove = [];
-
-    // Collect all keys first
+    const keys = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && k.startsWith(prefix)) {
-        keysToRemove.push(k);
-      }
+      if (k?.startsWith(prefix)) keys.push(k);
+    }
+    keys.forEach(k => localStorage.removeItem(k));
+  }
+
+  // ---------- Fee preference ----------
+  const getIncludeFee   = () => { try { const v = localStorage.getItem(PREF_INCLUDE_FEE); return v === null ? true : v === 'true'; } catch { return true; } };
+  const setIncludeFee   = v  => { try { localStorage.setItem(PREF_INCLUDE_FEE, String(v)); } catch {} };
+  const getDisplayPrice = p  => p == null ? null : (getIncludeFee() ? p : Math.max(0, p - COMC_FEE));
+
+  // ---------- COMC fetch via worker ----------
+  function comcSearchUrl(query) {
+    const enc = query.replace(/\./g, '{46}').replace(/,/g, '~2c');
+    return 'https://www.comc.com/Cards,=' + encodeURIComponent(enc) + ',fb,aUngraded';
+  }
+
+  /**
+   * Send a fetch request to the comc.com worker tab via GM shared storage.
+   * The worker (comc-worker.user.js) runs on any open comc.com tab and
+   * fulfils the request using same-origin fetch() — no CF issues.
+   */
+  async function fetchSearchHtml(query) {
+    const url = comcSearchUrl(query);
+
+    if (!worker.alive) {
+      return { ok: false, error: 'worker offline', workerOffline: true, url };
     }
 
-    // Then remove them
-    keysToRemove.forEach(k => localStorage.removeItem(k));
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    await GM_setValue('comc_req', JSON.stringify({ id, url }));
+
+    const deadline = Date.now() + WORKER_TIMEOUT;
+    while (Date.now() < deadline) {
+      await delay(400);
+      const raw = await GM_getValue('comc_res_' + id, null);
+      if (raw != null) {
+        await GM_deleteValue('comc_res_' + id);
+        try {
+          const result = JSON.parse(raw);
+          if (result.ok) return { ok: true, html: result.html, url };
+          return { ok: false, status: result.status, error: result.error, url };
+        } catch {
+          return { ok: false, error: 'response parse error', url };
+        }
+      }
+    }
+    return { ok: false, error: 'worker timeout', workerOffline: true, url };
   }
 
-  // ---------- COMC fetch ----------
-  /**
-   * Build COMC search URL with proper encoding.
-   * @param {string} query - Search query
-   * @returns {string} Formatted COMC search URL
-   */
-  function comcSearchUrl(query) {
-    // COMC uses non-standard URL format: /Cards,={query}
-    const base = 'https://www.comc.com/Cards,=';
-
-    // COMC uses custom encoding before standard URL encoding:
-    // . (dot) → {46}
-    // , (comma) → ~2c
-    // Then standard encodeURIComponent handles the rest
-    const comcEncoded = query
-      .replace(/\./g, '{46}')  // dots become {46}
-      .replace(/,/g, '~2c');   // commas become ~2c
-
-    return base + encodeURIComponent(comcEncoded) + ',fb,aUngraded';
-  }
-
-  /**
-   * Fetch COMC search results HTML.
-   * @param {string} query - Search query
-   * @returns {Promise<Object>} Promise resolving to response object
-   */
-  function fetchSearchHtml(query) {
-    const url = comcSearchUrl(query);
-    return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        onload: (resp) => resolve(resp.status >= 200 && resp.status < 300
-          ? { ok: true, html: resp.responseText || '', url }
-          : { ok: false, status: resp.status, url }),
-        onerror: (e) => resolve({ ok: false, error: e?.error || 'network error', url })
-      });
-    });
-  }
-
-  // ---------- Parse COMC search ----------
-  /**
-   * Parse COMC search results HTML.
-   * @param {string} html - HTML content to parse
-   * @returns {Object} Parsed search results with items and counts
-   */
+  // ---------- Parse COMC results ----------
   function parseSearch(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const wrappers = [...doc.querySelectorAll('.results .cardInfoWrapper')];
-
-    const nonAuctionItems = [];
-    let nonAuctionTotal = 0, auctionTotal = 0, baseCount = 0, nonBaseCount = 0;
+    const items = [];
+    let nonAuctionTotal = 0, auctionTotal = 0;
 
     for (const w of wrappers) {
       const dataDiv  = w.querySelector('.carddata');
       const priceDiv = w.querySelector('.listprice');
       if (!dataDiv || !priceDiv) continue;
-
-      const isAuction = priceDiv.classList.contains('auctionItem');
-      if (isAuction) { auctionTotal++; continue; }
+      if (priceDiv.classList.contains('auctionItem')) { auctionTotal++; continue; }
       nonAuctionTotal++;
 
       const desc   = clean(dataDiv.querySelector('.description')?.textContent || '');
-      const titleA = dataDiv.querySelector('h3.title a');
-      const href   = titleA?.getAttribute('href') || '';
-      const link   = href ? ('https://www.comc.com' + href) : null;
-
-      let price = null;
-      const priceText = (priceDiv.querySelector('a')?.textContent || priceDiv.textContent);
-      const m = priceText.match(/\$[\d,]*\.?\d{2}/);
-      if (m) price = parseFloat(m[0].replace(/[$,]/g, ''));
-
-      // Extract quantity from search results (e.g., "111 from " in .qty div)
-      let quantity = null;
-      const qtyDiv = priceDiv.querySelector('.qty');
-      if (qtyDiv) {
-        const qtyText = qtyDiv.textContent.trim();
-        const qtyMatch = qtyText.match(/^(\d+)\s+from/i);
-        if (qtyMatch) {
-          quantity = parseInt(qtyMatch[1], 10);
-        }
-      }
-
+      const href   = dataDiv.querySelector('h3.title a')?.getAttribute('href') || '';
+      const link   = href ? 'https://www.comc.com' + href : null;
+      const mPrice = (priceDiv.querySelector('a')?.textContent || priceDiv.textContent).match(/\$[\d,]*\.?\d{2}/);
+      const price  = mPrice ? parseFloat(mPrice[0].replace(/[$,]/g, '')) : null;
+      const qtyM   = priceDiv.querySelector('.qty')?.textContent.trim().match(/^(\d+)\s+from/i);
+      const quantity = qtyM ? parseInt(qtyM[1], 10) : null;
       const isBase = /\[\s*Base\s*\](?!\s*-\s*)/i.test(desc) || /\[\s*Base\s*\]\s*#\s*\d+/i.test(desc);
-
-      if (price != null) {
-        if (isBase) baseCount++; else nonBaseCount++;
-        nonAuctionItems.push({ desc, link, price, isBase, quantity });
-      }
+      if (price != null) items.push({ desc, link, price, isBase, quantity });
     }
-
-    return { nonAuctionItems, counts: { nonAuctionTotal, auctionTotal, baseCount, nonBaseCount } };
+    return { items, counts: { nonAuctionTotal, auctionTotal } };
   }
 
   // ---------- Chip UI ----------
-  /**
-   * Render or update price chip on card element.
-   * @param {HTMLElement} cardEl - Card DOM element
-   * @param {Object} payload - Chip display data
-   * @param {string} payload.text - Display text
-   * @param {string} [payload.title] - Tooltip title
-   * @param {string|null} [payload.link] - Click URL
-   * @param {boolean} [payload.isError] - Error state flag
-   * @param {string} [payload.tooltip] - Additional tooltip text
-   * @param {boolean|null} [payload.isPhysical] - Physical card indicator
-   * @param {boolean|null} [payload.isTransferable] - Transferability flag
-   * @param {number|null} [payload.quantity] - Available quantity
-   */
   async function renderChip(cardEl, payload) {
-    const { text, title = '', link = null, isError = false, tooltip = '', isPhysical = null, isTransferable = null, quantity = null, rawPrice = null } = payload;
+    const { text, title = '', link = null, isError = false, tooltip = '',
+            isPhysical = null, isTransferable = null, rawPrice = null } = payload;
     const footer = cardEl.querySelector('.card-footer') || cardEl;
     let chip = footer.querySelector(SELECTORS.PRICE_CHIP);
     if (!chip) {
@@ -694,505 +395,245 @@
       Object.assign(chip.style, {
         marginTop: '6px', padding: '3px 8px', border: '1px solid #ccc',
         borderRadius: '8px', fontSize: '12px', display: 'block',
-        cursor: 'default', userSelect: 'none', whiteSpace: 'nowrap'
+        cursor: 'default', userSelect: 'none', whiteSpace: 'nowrap',
       });
       footer.appendChild(chip);
     }
 
-    // Store raw COMC price for fee toggle recalculation
-    if (rawPrice != null) {
-      chip.dataset.rawPrice = String(rawPrice);
-    } else {
-      delete chip.dataset.rawPrice;
-    }
-    if (isPhysical !== null) {
-      chip.dataset.isPhysical = String(isPhysical);
-    }
+    if (rawPrice != null) chip.dataset.rawPrice = String(rawPrice);
+    else delete chip.dataset.rawPrice;
+    if (isPhysical !== null) chip.dataset.isPhysical = String(isPhysical);
 
-    // Build display text — apply fee adjustment when a raw price is available
     let displayText = text;
-    if (rawPrice != null) {
-      const displayPrice = getDisplayPrice(rawPrice);
-      displayText = `COMC: $${displayPrice.toFixed(2)}`;
-    }
-    if (isPhysical !== null) {
-      displayText += isPhysical ? '' : ' 💿';
-    }
-
+    if (rawPrice != null) displayText = `COMC: $${getDisplayPrice(rawPrice).toFixed(2)}`;
+    if (isPhysical !== null) displayText += isPhysical ? '' : ' 💿';
     chip.textContent = displayText;
 
-    // Build tooltip
-    let fullTooltip = '';
-
-    // Add transferability info to tooltip
-    if (isPhysical && !isTransferable) {
-      fullTooltip += 'Non-Transferable Physical Card\n';
-    }
-    fullTooltip += (tooltip ? (tooltip + '\n') : '') + title;
-
-    chip.title = fullTooltip;
-    chip.style.background = isError ? '#fee' : '';
+    let tt = '';
+    if (isPhysical && !isTransferable) tt += 'Non-Transferable Physical Card\n';
+    tt += (tooltip ? tooltip + '\n' : '') + title;
+    chip.title         = tt;
+    chip.style.background  = isError ? '#fee' : '';
     chip.style.borderColor = '#ccc';
-    chip.style.cursor = link ? 'pointer' : 'default';
-    chip.onclick = link ? () => window.open(link, '_blank') : null;
-
-    // update totals whenever a chip changes
+    chip.style.cursor      = link ? 'pointer' : 'default';
+    chip.onclick           = link ? () => window.open(link, '_blank') : null;
     await renderTotals();
   }
 
-  /**
-   * Remove all price chips and physical indicators from the page.
-   */
   async function clearChips() {
     document.querySelectorAll(`${SELECTORS.CARD} ${SELECTORS.PRICE_CHIP}`).forEach(c => c.remove());
     document.querySelectorAll(SELECTORS.PHYSICAL_INDICATOR).forEach(i => i.remove());
-    // Remove digital card styling class
-    document.querySelectorAll(SELECTORS.CARD).forEach(card => {
-      card.classList.remove('epack-digital-card');
-    });
-    await renderTotals(); // reset totals display immediately
+    document.querySelectorAll(SELECTORS.CARD).forEach(c => c.classList.remove('epack-digital-card'));
+    await renderTotals();
   }
 
-  /**
-   * Recalculate all displayed chip prices based on the current fee toggle,
-   * then update totals. Called when the user toggles the COMC fee preference.
-   */
   async function refreshAllPrices() {
     document.querySelectorAll(SELECTORS.PRICE_CHIP).forEach(chip => {
-      if (!chip.dataset.rawPrice) return;
-      const rawPrice = parseFloat(chip.dataset.rawPrice);
-      if (isNaN(rawPrice)) return;
-
-      const displayPrice = getDisplayPrice(rawPrice);
-      let text = `COMC: $${displayPrice.toFixed(2)}`;
-      if (chip.dataset.isPhysical === 'false') text += ' 💿';
-      chip.textContent = text;
+      const raw = parseFloat(chip.dataset.rawPrice);
+      if (isNaN(raw)) return;
+      let t = `COMC: $${getDisplayPrice(raw).toFixed(2)}`;
+      if (chip.dataset.isPhysical === 'false') t += ' 💿';
+      chip.textContent = t;
     });
     await renderTotals();
   }
 
-  /**
-   * Add physical card indicators to all physical cards in the trade.
-   */
   async function addPhysicalIndicators() {
-    try {
-      const tradeData = await getTradeData();
-      if (!tradeData) {
-        return;
-      }
-
-      const cardLookupMap = await buildCardLookupMap(tradeData);
-      const cards = document.querySelectorAll(SELECTORS.CARD);
-
-      if (cards.length === 0) {
-        return;
-      }
-
-      let addedCount = 0;
-
-      cards.forEach(card => {
-        try {
-          const domCardId = extractCardIdFromDom(card);
-          if (!domCardId) return;
-
-          const apiCardData = cardLookupMap.get(domCardId);
-          let isPhysical = apiCardData?.isPhysical ?? false;
-          let isTransferable = apiCardData?.isTransferable ?? false;
-
-          // Fallback: check DOM for physical status in edit mode
-          if (!apiCardData && isInEditMode()) {
-            const cardBody = card.querySelector('.card-body');
-            isPhysical = cardBody ? cardBody.classList.contains('is-physical') : false;
-          }
-
-          if (!isPhysical) return;
-
-          // Find side-btn-items container
-          const sideBtnItems = card.querySelector(SELECTORS.SIDE_BTN_ITEMS);
-          if (!sideBtnItems) return;
-
-          // Check if indicator already exists
-          if (sideBtnItems.querySelector(SELECTORS.PHYSICAL_INDICATOR)) return;
-
-          // Create physical indicator div (matching structure of other side buttons)
-          const div = document.createElement('div');
-          div.className = 'side-btn tooltip-right epack-physical-indicator';
-
-          // Set tooltip based on transferability
-          const tooltipText = isTransferable ? 'Physical Card' : 'Physical Card (NT)';
-          div.setAttribute('data-tooltip', tooltipText);
-
-          const icon = document.createElement('i');
-          icon.className = 'ud ud-transfer';
-          icon.style.opacity = '0.7';
-          icon.style.color = isTransferable ? '#1d4fd3' : '#f89e2e';
-
-          div.appendChild(icon);
-
-          // Insert at the beginning of side-btn-items
-          sideBtnItems.insertBefore(div, sideBtnItems.firstChild);
-          addedCount++;
-        } catch (e) {
-          console.warn(LOG, 'Failed to add indicator for card:', e);
-        }
-      });
-
-    } catch (e) {
-      console.error(LOG, 'Failed to add indicators:', e);
-    }
+    const tradeData = await getTradeData(); if (!tradeData) return;
+    const map = await buildCardLookupMap(tradeData);
+    document.querySelectorAll(SELECTORS.CARD).forEach(card => {
+      try {
+        const id = extractCardIdFromDom(card); if (!id) return;
+        const api = map.get(id);
+        const isPhysical     = api?.isPhysical ?? (isInEditMode() ? (card.querySelector('.card-body')?.classList.contains('is-physical') ?? false) : false);
+        const isTransferable = api?.isTransferable ?? false;
+        if (!isPhysical) return;
+        const sbi = card.querySelector(SELECTORS.SIDE_BTN_ITEMS);
+        if (!sbi || sbi.querySelector(SELECTORS.PHYSICAL_INDICATOR)) return;
+        const div  = document.createElement('div');
+        div.className = 'side-btn tooltip-right epack-physical-indicator';
+        div.setAttribute('data-tooltip', isTransferable ? 'Physical Card' : 'Physical Card (NT)');
+        const icon = document.createElement('i');
+        icon.className = 'ud ud-transfer';
+        icon.style.opacity = '0.7';
+        icon.style.color   = isTransferable ? '#1d4fd3' : '#f89e2e';
+        div.appendChild(icon);
+        sbi.insertBefore(div, sbi.firstChild);
+      } catch {}
+    });
   }
 
-  /**
-   * Apply opacity styling to digital cards using CSS class.
-   */
   async function applyDigitalCardStyling() {
-    // Skip if feature is disabled
     if (!FADE_DIGITAL) return;
-
-    try {
-      // Inject CSS for digital cards (only once)
-      if (!document.getElementById('epack-digital-card-style')) {
-        const style = document.createElement('style');
-        style.id = 'epack-digital-card-style';
-        style.textContent = `
-          .epack-digital-card {
-            opacity: ${FADE_OPACITY} !important;
-            transition: opacity 0.2s ease !important;
-          }
-          .epack-digital-card:hover {
-            opacity: 1 !important;
-          }
-        `;
-        document.head.appendChild(style);
-      }
-
-      const tradeData = await getTradeData();
-      if (!tradeData) {
-        return;
-      }
-
-      const cardLookupMap = await buildCardLookupMap(tradeData);
-      const cards = document.querySelectorAll(SELECTORS.CARD);
-
-      if (cards.length === 0) {
-        return;
-      }
-
-      cards.forEach(card => {
-        try {
-          const domCardId = extractCardIdFromDom(card);
-          if (!domCardId) return;
-
-          const apiCardData = cardLookupMap.get(domCardId);
-          let isPhysical;
-
-          if (apiCardData) {
-            isPhysical = apiCardData.isPhysical;
-          } else if (isInEditMode()) {
-            // Fallback: check DOM for physical status
-            const cardBody = card.querySelector('.card-body');
-            isPhysical = cardBody ? cardBody.classList.contains('is-physical') : null;
-          } else {
-            return;
-          }
-
-          // Add CSS class for digital cards
-          if (isPhysical === false) {
-            card.classList.add('epack-digital-card');
-          } else {
-            card.classList.remove('epack-digital-card');
-          }
-        } catch (e) {
-          console.warn(LOG, 'Failed to apply styling for card:', e);
-        }
-      });
-
-    } catch (e) {
-      console.error(LOG, 'Failed to apply digital card styling:', e);
+    if (!document.getElementById('epack-digital-card-style')) {
+      const s = document.createElement('style');
+      s.id = 'epack-digital-card-style';
+      s.textContent = `.epack-digital-card{opacity:${FADE_OPACITY}!important;transition:opacity .2s ease!important}
+                       .epack-digital-card:hover{opacity:1!important}`;
+      document.head.appendChild(s);
     }
+    const tradeData = await getTradeData(); if (!tradeData) return;
+    const map = await buildCardLookupMap(tradeData);
+    document.querySelectorAll(SELECTORS.CARD).forEach(card => {
+      try {
+        const id = extractCardIdFromDom(card); if (!id) return;
+        const api = map.get(id);
+        const isPhysical = api ? api.isPhysical
+          : (isInEditMode() ? (card.querySelector('.card-body')?.classList.contains('is-physical') ?? null) : null);
+        if (isPhysical === null) return;
+        card.classList.toggle('epack-digital-card', isPhysical === false);
+      } catch {}
+    });
   }
 
-  // ---------- Totals helpers (YOU GET / YOU GIVE) ----------
-  /**
-   * Find and return the "You Get" and "You Give" container elements.
-   * @returns {Object} Object with getEl and giveEl properties
-   */
+  // ---------- Totals ----------
   function findSideContainers() {
-    // Primary: order-based selection (stable on ePack)
     const sides = document.querySelectorAll(SELECTORS.TRADE_SIDES);
-    if (sides.length >= 2) {
-      // You get is first; You give is second
-      return { getEl: sides[0], giveEl: sides[1] };
-    }
-
-    // Fallback to text-heuristic if layout differs (rare)
-    const root = document.querySelector('.trade-detail.row');
-    if (!root) return { getEl: null, giveEl: null };
-
-    const leaves = [...root.querySelectorAll('*')].filter(el => el.childElementCount === 0 || /^H\d$/i.test(el.tagName));
-    let getHdr = null, giveHdr = null;
-    for (const el of leaves) {
-      const txt = (el.textContent || '').trim().toUpperCase();
-      if (!getHdr && /\bYOU\s+GET\b/.test(txt)) getHdr = el;
-      if (!giveHdr && /\bYOU\s+GIVE\b/.test(txt)) giveHdr = el;
-      if (getHdr && giveHdr) break;
-    }
-    const pickCol = (el) => el ? (el.closest('.trade-side.col-sm-6') || el.closest('[class*="col-"]') || el.closest('.row') || el.parentElement) : null;
-    return { getEl: pickCol(getHdr), giveEl: pickCol(giveHdr) };
+    if (sides.length >= 2) return { getEl: sides[0], giveEl: sides[1] };
+    return { getEl: null, giveEl: null };
   }
 
-  /**
-   * Parse price value from chip element.
-   * @param {HTMLElement|null} chipEl - Chip element containing price
-   * @returns {number|null} Parsed price or null
-   */
-  function parseChipPrice(chipEl) {
-    if (!chipEl) return null;
-    const m = chipEl.textContent.match(/\$([\d,]*\.?\d{2})/);
+  function parseChipPrice(chip) {
+    if (!chip) return null;
+    const m = chip.textContent.match(/\$([\d,]*\.?\d{2})/);
     return m ? parseFloat(m[1].replace(/,/g, '')) : null;
   }
 
-  /**
-   * Compute totals for one side of the trade.
-   * @param {HTMLElement|null} containerEl - Container element for one side
-   * @returns {Promise<Object>} Totals object with sum, qty, missing, digital, total
-   */
-  async function computeSideTotals(containerEl) {
-    if (!containerEl) return { sum: 0, qty: 0, missing: 0, digital: 0, total: 0 };
-
-    // Get API data to check if cards are digital
+  async function computeSideTotals(el) {
+    if (!el) return { sum: 0, qty: 0, missing: 0, digital: 0, total: 0 };
     const tradeData = await getTradeData();
-    const cardLookupMap = tradeData ? await buildCardLookupMap(tradeData) : new Map();
-
-    // Each visible card tile == 1 unit
-    const cards = [...containerEl.querySelectorAll(SELECTORS.CARD)];
-
-    const editMode = isInEditMode();
-    let sum = 0;
-    let priced = 0;
-    let digital = 0;
-
+    const map  = tradeData ? await buildCardLookupMap(tradeData) : new Map();
+    const edit = isInEditMode();
+    let sum = 0, priced = 0, digital = 0;
+    const cards = [...el.querySelectorAll(SELECTORS.CARD)];
     for (const card of cards) {
-      const chip  = card.querySelector(SELECTORS.PRICE_CHIP);
-      const price = parseChipPrice(chip); // returns number or null
-
-      // Check if card is digital
-      const domCardId = extractCardIdFromDom(card);
-      const apiCardData = domCardId ? cardLookupMap.get(domCardId) : null;
-      let isDigital = false;
-
-      if (apiCardData) {
-        isDigital = apiCardData.isPhysical === false;
-      } else if (editMode) {
-        // Fallback: check DOM for physical status
-        const cardBody = card.querySelector('.card-body');
-        isDigital = cardBody ? !cardBody.classList.contains('is-physical') : false;
-      }
-
-      if (isDigital) {
-        digital += 1;
-      } else if (price != null) {
-        sum += price;    // 1 per tile (no multipliers)
-        priced += 1;
-      }
+      const price = parseChipPrice(card.querySelector(SELECTORS.PRICE_CHIP));
+      const id    = extractCardIdFromDom(card);
+      const api   = id ? map.get(id) : null;
+      const isDig = api ? api.isPhysical === false
+        : (edit ? !(card.querySelector('.card-body')?.classList.contains('is-physical') ?? true) : false);
+      if (isDig) digital++;
+      else if (price != null) { sum += price; priced++; }
     }
-
-    const total = cards.length;
-    const missing = total - priced - digital; // Don't count digital as missing
-
-    return { sum, qty: priced, missing, digital, total };
+    return { sum, qty: priced, missing: cards.length - priced - digital, digital, total: cards.length };
   }
 
-  /**
-   * Ensure totals display row exists in DOM.
-   * @returns {HTMLElement|null} Totals row element or null
-   */
   function ensureTotalsRow() {
     const anchor = document.getElementById(ANCHOR_ID);
     if (!anchor) return null;
-
     let row = document.getElementById(TOTALS_ID);
     if (!row) {
       row = document.createElement('div');
       row.id = TOTALS_ID;
       Object.assign(row.style, {
-        marginTop: '12px',
-        padding: '10px 16px',
-        background: '#f8f9fa',
-        border: '1px solid #dee2e6',
-        borderRadius: '6px',
-        fontSize: '14px',
-        display: 'flex',
-        gap: '32px',
-        alignItems: 'center',
-        flexWrap: 'wrap',
-        fontWeight: '500'
+        marginTop: '12px', padding: '10px 16px', background: '#f8f9fa',
+        border: '1px solid #dee2e6', borderRadius: '6px', fontSize: '14px',
+        display: 'flex', gap: '32px', alignItems: 'center', flexWrap: 'wrap', fontWeight: '500',
       });
       anchor.appendChild(row);
     }
     return row;
   }
 
-  /**
-   * Render or update totals display for both sides of trade.
-   */
   async function renderTotals() {
-    const row = ensureTotalsRow();
-    if (!row) return;
-
+    const row = ensureTotalsRow(); if (!row) return;
     const { getEl, giveEl } = findSideContainers();
-    const getTotals  = await computeSideTotals(getEl);   // { sum, qty, missing, digital, total }
-    const giveTotals = await computeSideTotals(giveEl);  // { sum, qty, missing, digital, total }
-
+    const [gt, gvt] = await Promise.all([computeSideTotals(getEl), computeSideTotals(giveEl)]);
     row.textContent = '';
     const mk = (label, t) => {
       const span = document.createElement('span');
       span.style.fontWeight = '600';
-      // Build the text parts
-      let text = `${label}: $${t.sum.toFixed(2)} (priced: ${t.qty}/${t.total}`;
-      if (t.digital > 0) {
-        text += `, digital: ${t.digital}`;
-      }
-      if (t.missing > 0) {
-        text += `, missing: ${t.missing}`;
-      }
-      text += ')';
-      span.textContent = text;
+      let txt = `${label}: $${t.sum.toFixed(2)} (priced: ${t.qty}/${t.total}`;
+      if (t.digital > 0) txt += `, digital: ${t.digital}`;
+      if (t.missing > 0) txt += `, missing: ${t.missing}`;
+      span.textContent = txt + ')';
       return span;
     };
-
-    row.appendChild(mk('You get total', getTotals));
-    row.appendChild(mk('You give total', giveTotals));
+    row.appendChild(mk('You get total', gt));
+    row.appendChild(mk('You give total', gvt));
   }
 
-  // ---------- Fetch flow (manual trigger) ----------
-  /**
-   * Main workflow to fetch and display COMC prices for all cards.
-   * @param {Function} [setStatus] - Optional callback to update status text
-   */
+  // ---------- Fetch flow ----------
   async function runFetchFlow(setStatus) {
     const cards = [...document.querySelectorAll(SELECTORS.CARD)];
     if (!cards.length) { setStatus?.('No cards'); return; }
-
-    // Reset abort flag
     state.shouldAbort = false;
-    state.isFetching = true;
+    state.isFetching  = true;
 
     try {
-      // Load trade API data first
-      setStatus?.('Loading trade data...');
+      setStatus?.('Loading trade data…');
       const tradeData = await getTradeData();
-      const cardLookupMap = await buildCardLookupMap(tradeData);
-      const editMode = isInEditMode();
-
+      const map       = await buildCardLookupMap(tradeData);
+      const edit      = isInEditMode();
       let idx = 0;
+
       for (const card of cards) {
-        // Check abort flag
-        if (state.shouldAbort) {
-          setStatus?.('Aborted');
-          await delay(DELAY_MS);
-          setStatus?.('');
-          return;
-        }
+        if (state.shouldAbort) { setStatus?.('Aborted'); await delay(DELAY_MS); setStatus?.(''); return; }
 
-        const domCardId = extractCardIdFromDom(card);
-        const apiCardData = domCardId ? cardLookupMap.get(domCardId) : null;
-
-        let meta = extractCardMeta(apiCardData);
-        if (!meta || !meta.query) {
-          // Fallback: extract from DOM when in edit/draft mode (newly added cards)
-          if (editMode) {
-            meta = extractCardMetaFromDom(card);
-            if (!meta || !meta.query) {
-              continue;
-            }
-          } else {
-            continue;
-          }
+        const id  = extractCardIdFromDom(card);
+        const api = id ? map.get(id) : null;
+        let meta  = extractCardMeta(api);
+        if (!meta?.query) {
+          if (edit) { meta = extractCardMetaFromDom(card); if (!meta?.query) continue; }
+          else continue;
         }
 
         setStatus?.(`(${++idx}/${cards.length}) ${meta.player}…`);
 
-        // Skip COMC query for digital-only cards (no value on COMC)
         if (meta.isPhysical === false) {
-          await renderChip(card, {
-            text: 'COMC: N/A (Digital)',
-            title: 'Digital-only card - no physical value available',
-            isPhysical: meta.isPhysical
-          });
+          await renderChip(card, { text: 'COMC: N/A (Digital)', title: 'Digital-only card', isPhysical: false });
           await delay(DELAY_MS);
           continue;
         }
 
-        await renderChip(card, { text: 'COMC: …', title: `Fetching for: ${meta.query}`, isPhysical: meta.isPhysical });
+        await renderChip(card, { text: 'COMC: …', title: `Fetching: ${meta.query}`, isPhysical: meta.isPhysical });
 
-        // cache
         const cached = getCached(meta.query);
         if (cached) {
-          const priceTxt = cached.price != null ? `COMC: $${cached.price.toFixed(2)}` : 'COMC: —';
           await renderChip(card, {
-            text: priceTxt,
-            title: cached.link || 'COMC search',
-            link: cached.link || null,
-            tooltip: cached.tooltip || '',
-            isPhysical: meta.isPhysical,
-            isTransferable: meta.isTransferable,
-            quantity: cached.quantity ?? null,
-            rawPrice: cached.price
+            text: cached.price != null ? `COMC: $${cached.price.toFixed(2)}` : 'COMC: —',
+            title: cached.link || 'COMC search', link: cached.link || null,
+            tooltip: cached.tooltip || '', isPhysical: meta.isPhysical,
+            isTransferable: meta.isTransferable, rawPrice: cached.price,
           });
           await delay(DELAY_MS);
           continue;
         }
 
-        // Fetch search results
         const resp = await fetchSearchHtml(meta.query);
+
         if (!resp.ok) {
-          await renderChip(card, { text: 'COMC: n/a', title: resp.error || ('HTTP ' + resp.status), isError: true, isPhysical: meta.isPhysical });
+          let text  = 'COMC: n/a';
+          let title = resp.error || `HTTP ${resp.status}`;
+          if (resp.workerOffline) {
+            text  = 'COMC: worker offline';
+            title = 'Open a comc.com tab in Chrome (with the ePack COMC Worker script installed), then click Refresh Prices.';
+          }
+          await renderChip(card, { text, title, isError: true, isPhysical: meta.isPhysical });
           console.warn(LOG, 'Fetch failed:', meta.query, resp);
           await delay(DELAY_MS);
           continue;
         }
 
-        const parsed = parseSearch(resp.html);
-        const { nonAuctionItems, counts } = parsed;
-
-        let cheapest = null;
-        if (nonAuctionItems.length) cheapest = nonAuctionItems.slice().sort((a,b) => a.price - b.price)[0];
+        const { items, counts } = parseSearch(resp.html);
+        const cheapest = items.length ? items.slice().sort((a, b) => a.price - b.price)[0] : null;
 
         if (!cheapest) {
           const searchLink = comcSearchUrl(meta.query);
-          const tooltip = `Search results: ${counts.nonAuctionTotal} listings`;
-          setCached(meta.query, { price: null, link: searchLink, tooltip, quantity: null });
-          await renderChip(card, { text: 'COMC: —', title: searchLink, link: searchLink, tooltip, isPhysical: meta.isPhysical, isTransferable: meta.isTransferable, quantity: null });
-          await delay(REQ_DELAY_MS + Math.random() * REQ_DELAY_RANDOM);
-          continue;
+          const tooltip    = `${counts.nonAuctionTotal} listings on COMC`;
+          setCached(meta.query, { price: null, link: searchLink, tooltip });
+          await renderChip(card, { text: 'COMC: —', title: searchLink, link: searchLink, tooltip,
+                                   isPhysical: meta.isPhysical, isTransferable: meta.isTransferable });
+        } else {
+          const link    = cheapest.link || comcSearchUrl(meta.query);
+          const tooltip = cheapest.quantity != null
+            ? `${cheapest.quantity} available on COMC`
+            : `${counts.nonAuctionTotal} listings on COMC`;
+          setCached(meta.query, { price: cheapest.price, link, tooltip });
+          await renderChip(card, { text: `COMC: $${cheapest.price.toFixed(2)}`, title: link, link,
+                                   tooltip, isPhysical: meta.isPhysical, isTransferable: meta.isTransferable,
+                                   rawPrice: cheapest.price });
         }
-
-        // Build result from search data only (no item page fetch needed)
-        const pickedLink = cheapest.link || comcSearchUrl(meta.query);
-        const tooltip = cheapest.quantity != null
-          ? `${cheapest.quantity} available on COMC`
-          : `Search results: ${counts.nonAuctionTotal} listings`;
-
-        const final = {
-          price: cheapest.price,
-          link: pickedLink,
-          quantity: cheapest.quantity ?? null,
-          tooltip: tooltip
-        };
-
-        setCached(meta.query, final);
-
-        await renderChip(card, {
-          text: `COMC: $${final.price.toFixed(2)}`,
-          title: pickedLink,
-          link: pickedLink,
-          tooltip: tooltip,
-          isPhysical: meta.isPhysical,
-          isTransferable: meta.isTransferable,
-          quantity: final.quantity ?? null,
-          rawPrice: final.price
-        });
 
         await delay(REQ_DELAY_MS + Math.random() * REQ_DELAY_RANDOM);
       }
@@ -1204,163 +645,113 @@
     }
   }
 
-  // ---------- Toolbar UI ----------
-  /**
-   * Get consistent button styling.
-   * @returns {Object} Style object for buttons
-   */
-  function buttonStyle() {
-    return {
-      padding: '8px 16px',
-      fontSize: '13px',
-      borderRadius: '6px',
-      border: '1px solid #007bff',
-      background: '#007bff',
-      color: 'white',
-      cursor: 'pointer',
-      fontWeight: '500',
-      transition: 'all 0.2s'
-    };
+  // ---------- Toolbar ----------
+  let _workerBadgeEl = null;
+
+  function updateWorkerBadge(alive) {
+    if (!_workerBadgeEl) return;
+    if (alive) {
+      _workerBadgeEl.textContent = '⚡ worker ✓';
+      _workerBadgeEl.title = 'COMC worker tab is active. Fetches run as same-origin requests from your comc.com tab.';
+      Object.assign(_workerBadgeEl.style, { background: '#d4edda', color: '#155724', borderColor: '#c3e6cb' });
+    } else {
+      _workerBadgeEl.textContent = '⚠ open comc.com tab';
+      _workerBadgeEl.title = 'No comc.com worker found.\nOpen a comc.com tab in Chrome with the ePack COMC Worker script installed.';
+      Object.assign(_workerBadgeEl.style, { background: '#fff3cd', color: '#856404', borderColor: '#ffc107' });
+    }
   }
 
-  /**
-   * Build toolbar UI with control buttons.
-   * @returns {HTMLElement} Toolbar element
-   */
   function buildToolbar() {
     const wrapper = document.createElement('div');
     wrapper.id = TOOLBAR_ID;
-    Object.assign(wrapper.style, {
-      display: 'flex',
-      gap: '12px',
-      alignItems: 'center',
-      justifyContent: 'flex-start',
-      width: '100%'
-    });
+    Object.assign(wrapper.style, { display: 'flex', gap: '12px', alignItems: 'center', width: '100%' });
 
-    const fetchBtn   = document.createElement('button');
-    const refreshBtn = document.createElement('button');
-    const abortBtn   = document.createElement('button');
-    const status     = document.createElement('span');
+    const fetchBtn    = document.createElement('button');
+    const refreshBtn  = document.createElement('button');
+    const abortBtn    = document.createElement('button');
+    const workerBadge = document.createElement('span');
+    const status      = document.createElement('span');
 
-    fetchBtn.textContent = 'Fetch COMC Prices';
+    fetchBtn.textContent   = 'Fetch COMC Prices';
     refreshBtn.textContent = 'Refresh Prices';
-    abortBtn.textContent = 'Abort';
-    abortBtn.style.display = 'none'; // Hidden by default
+    abortBtn.textContent   = 'Abort';
+    abortBtn.style.display = 'none';
 
-    Object.assign(fetchBtn.style, buttonStyle());
-    Object.assign(refreshBtn.style, {
-      ...buttonStyle(),
-      background: '#6c757d',
-      borderColor: '#6c757d'
+    const btnStyle = () => ({
+      padding: '8px 16px', fontSize: '13px', borderRadius: '6px',
+      border: '1px solid #007bff', background: '#007bff', color: 'white',
+      cursor: 'pointer', fontWeight: '500', transition: 'all 0.2s',
     });
-    Object.assign(abortBtn.style, {
-      ...buttonStyle(),
-      background: '#dc3545',
-      borderColor: '#dc3545'
+    Object.assign(fetchBtn.style,   btnStyle());
+    Object.assign(refreshBtn.style, { ...btnStyle(), background: '#6c757d', borderColor: '#6c757d' });
+    Object.assign(abortBtn.style,   { ...btnStyle(), background: '#dc3545', borderColor: '#dc3545' });
+    Object.assign(status.style,     { fontSize: '13px', color: '#555', fontWeight: '500' });
+    Object.assign(workerBadge.style, {
+      fontSize: '11px', padding: '2px 8px', borderRadius: '10px', fontWeight: '600',
+      background: '#e9ecef', color: '#6c757d', border: '1px solid #dee2e6', cursor: 'default',
     });
-    Object.assign(status.style, {
-      fontSize: '13px',
-      color: '#555',
-      fontWeight: '500',
-      marginLeft: '8px'
+    workerBadge.textContent = '⏳ worker…';
+    _workerBadgeEl = workerBadge;
+
+    // Check worker asynchronously so the toolbar renders immediately
+    ensureWorkerChecked().then(() => updateWorkerBadge(worker.alive));
+
+    // Fee toggle
+    const feeWrap = document.createElement('div');
+    Object.assign(feeWrap.style, {
+      display: 'inline-flex', alignItems: 'center', gap: '8px',
+      marginLeft: 'auto', fontWeight: '600', fontSize: '14px',
     });
+    const feeLabel = document.createElement('span');
+    feeLabel.textContent = `Incl. COMC fee ($${COMC_FEE.toFixed(2)}/card)`;
+    const onoff = document.createElement('div');
+    onoff.className = 'onoffswitch'; onoff.style.lineHeight = '1.5'; onoff.style.top = '3px';
+    const ol = document.createElement('label'); ol.className = 'onoffswitch-label';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'onoffswitch-checkbox'; cb.checked = getIncludeFee();
+    const inner = document.createElement('span'); inner.className = 'onoffswitch-inner';
+    const sw    = document.createElement('span'); sw.className    = 'onoffswitch-switch';
+    ol.append(cb, inner, sw); onoff.appendChild(ol); feeWrap.append(feeLabel, onoff);
+    cb.onchange = () => { setIncludeFee(cb.checked); refreshAllPrices(); };
 
-    // Fee toggle — reuses ePack's native .onoffswitch styling (persisted in localStorage)
-    const feeToggleWrap = document.createElement('div');
-    Object.assign(feeToggleWrap.style, {
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: '8px',
-      marginLeft: 'auto',
-      textAlign: 'right',
-      fontWeight: '600',
-      fontSize: '14px'
-    });
+    wrapper.append(fetchBtn, refreshBtn, abortBtn, workerBadge, status, feeWrap);
 
-    const feeLabelText = document.createElement('span');
-    feeLabelText.textContent = `Incl. COMC fee ($${COMC_FEE.toFixed(2)}/card)`;
-
-    const onoffDiv = document.createElement('div');
-    onoffDiv.className = 'onoffswitch';
-    onoffDiv.style.lineHeight = '1.5';
-    onoffDiv.style.top = '3px';
-
-    const onoffLabel = document.createElement('label');
-    onoffLabel.className = 'onoffswitch-label';
-
-    const feeCheckbox = document.createElement('input');
-    feeCheckbox.type = 'checkbox';
-    feeCheckbox.className = 'onoffswitch-checkbox';
-    feeCheckbox.checked = getIncludeFee();
-
-    const innerSpan = document.createElement('span');
-    innerSpan.className = 'onoffswitch-inner';
-
-    const switchSpan = document.createElement('span');
-    switchSpan.className = 'onoffswitch-switch';
-
-    onoffLabel.append(feeCheckbox, innerSpan, switchSpan);
-    onoffDiv.appendChild(onoffLabel);
-
-    feeToggleWrap.append(feeLabelText, onoffDiv);
-
-    feeCheckbox.onchange = () => {
-      setIncludeFee(feeCheckbox.checked);
-      refreshAllPrices();
-    };
-
-    wrapper.append(fetchBtn, refreshBtn, abortBtn, status, feeToggleWrap);
-
-    // Button hover effects
-    [fetchBtn, refreshBtn, abortBtn].forEach(btn => {
-      btn.onmouseenter = () => { btn.style.opacity = '0.9'; btn.style.transform = 'translateY(-1px)'; };
-      btn.onmouseleave = () => { btn.style.opacity = '1'; btn.style.transform = 'translateY(0)'; };
+    [fetchBtn, refreshBtn, abortBtn].forEach(b => {
+      b.onmouseenter = () => { b.style.opacity = '0.9'; b.style.transform = 'translateY(-1px)'; };
+      b.onmouseleave = () => { b.style.opacity = '1';   b.style.transform = 'translateY(0)'; };
     });
 
-    fetchBtn.onclick = async () => {
-      fetchBtn.disabled = true; refreshBtn.disabled = true;
-      fetchBtn.style.opacity = '0.6'; refreshBtn.style.opacity = '0.6';
-      abortBtn.style.display = 'inline-block'; // Show abort button
-      status.textContent = 'Fetching…';
-      try { await runFetchFlow(msg => status.textContent = msg); }
+    const lock = async (label, fn) => {
+      fetchBtn.disabled = refreshBtn.disabled = true;
+      fetchBtn.style.opacity = refreshBtn.style.opacity = '0.6';
+      abortBtn.style.display = 'inline-block';
+      status.textContent = label;
+      try { await fn(); }
       finally {
-        fetchBtn.disabled = false; refreshBtn.disabled = false;
-        fetchBtn.style.opacity = '1'; refreshBtn.style.opacity = '1';
-        abortBtn.style.display = 'none'; // Hide abort button
+        fetchBtn.disabled = refreshBtn.disabled = false;
+        fetchBtn.style.opacity = refreshBtn.style.opacity = '1';
+        abortBtn.style.display = 'none';
         status.textContent = '';
       }
     };
 
-    refreshBtn.onclick = async () => {
-      fetchBtn.disabled = true; refreshBtn.disabled = true;
-      fetchBtn.style.opacity = '0.6'; refreshBtn.style.opacity = '0.6';
-      abortBtn.style.display = 'inline-block'; // Show abort button
-      status.textContent = 'Refreshing…';
-      try {
-        await clearChips();
-        clearCache();
-        state.cachedTradeData = null; // Clear cached API data
-        state.partnerInfoInjected = false; // Allow re-injection of partner info
-        await runFetchFlow(msg => status.textContent = msg);
-        // Re-inject trade partner info after refresh
-        const tradeData = await getTradeData();
-        if (tradeData) {
-          injectTradePartnerInfo(tradeData);
-          state.partnerInfoInjected = true;
-        }
-        // Re-add physical indicators after refresh
-        await addPhysicalIndicators();
-        // Apply digital card styling
-        await applyDigitalCardStyling();
-      }
-      finally {
-        fetchBtn.disabled = false; refreshBtn.disabled = false;
-        fetchBtn.style.opacity = '1'; refreshBtn.style.opacity = '1';
-        abortBtn.style.display = 'none'; // Hide abort button
-        status.textContent = '';
-      }
-    };
+    fetchBtn.onclick = () => lock('Fetching…', () => runFetchFlow(m => status.textContent = m));
+
+    refreshBtn.onclick = () => lock('Refreshing…', async () => {
+      await clearChips();
+      clearCache();
+      state.cachedTradeData = null;
+      state.partnerInfoInjected = false;
+      // Re-check worker on explicit refresh
+      worker.checked = false;
+      await ensureWorkerChecked();
+      updateWorkerBadge(worker.alive);
+      await runFetchFlow(m => status.textContent = m);
+      const td = await getTradeData();
+      if (td) { injectTradePartnerInfo(td); state.partnerInfoInjected = true; }
+      await addPhysicalIndicators();
+      await applyDigitalCardStyling();
+    });
 
     abortBtn.onclick = () => {
       state.shouldAbort = true;
@@ -1371,305 +762,130 @@
     return wrapper;
   }
 
-  /**
-   * Mount toolbar UI under the trade detail header.
-   * @returns {boolean} True if successfully mounted
-   */
-  function mountToolbarUnderTradeDetail() {
+  function mountToolbar() {
     const header = document.querySelector(SELECTORS.TRADE_HEADER);
-    if (!header) {
-      return false;
-    }
-
-    // Reduce spacing below header
+    if (!header) return false;
     header.style.marginBottom = '16px';
-
     let anchor = document.getElementById(ANCHOR_ID);
     if (!anchor) {
       anchor = document.createElement('div');
       anchor.id = ANCHOR_ID;
       Object.assign(anchor.style, {
-        marginTop: '0px',
-        marginBottom: '12px',
-        padding: '12px 15px',
-        background: 'white',
-        boxShadow: '0 1px 5px 0 rgba(0, 0, 0, .1)'
+        marginTop: '0px', marginBottom: '12px', padding: '12px 15px',
+        background: 'white', boxShadow: '0 1px 5px 0 rgba(0,0,0,.1)',
       });
-      // place AFTER the header (as next sibling)
       header.insertAdjacentElement('afterend', anchor);
     }
-
-    if (!anchor.querySelector(SELECTORS.TOOLBAR)) {
-      anchor.appendChild(buildToolbar());
-    }
-    // ensure totals row exists (empty until we compute)
+    if (!anchor.querySelector(SELECTORS.TOOLBAR)) anchor.appendChild(buildToolbar());
     ensureTotalsRow();
     return true;
   }
 
-  // ---------- Trade Partner Info ----------
-  /**
-   * Inject trade partner's last login date and rating into the UI.
-   * @param {Object} tradeData - Trade data from API
-   * @returns {boolean} True if info was successfully injected
-   */
+  // ---------- Trade partner info ----------
   function injectTradePartnerInfo(tradeData) {
-    if (!tradeData) {
-      return false;
-    }
-
+    if (!tradeData) return false;
     const container = document.querySelector(SELECTORS.PARTNER_CONTAINER);
-    if (!container) {
-      return false;
-    }
+    if (!container) return false;
+    const partner = getTradePartnerUsername();
+    if (!partner) return false;
 
-    // Get trade partner's username from the visible element
-    const partnerUsername = getTradePartnerUsername();
-    if (!partnerUsername) {
-      return false;
-    }
+    const pIsInit = tradeData.Initiator?.UserName?.toLowerCase()    === partner.toLowerCase();
+    const pIsCp   = tradeData.Counterparty?.UserName?.toLowerCase() === partner.toLowerCase();
+    const lastLogin   = pIsInit ? tradeData.Initiator?.LastLoginDate    : (pIsCp ? tradeData.Counterparty?.LastLoginDate    : null);
+    const ratingGiven = pIsInit ? tradeData.InitiatorRating             : (pIsCp ? tradeData.CounterpartyRating             : 0);
 
-    // Determine current user's role by process of elimination
-    const partnerIsInitiator = tradeData.Initiator?.UserName?.toLowerCase() === partnerUsername.toLowerCase();
-    const partnerIsCounterparty = tradeData.Counterparty?.UserName?.toLowerCase() === partnerUsername.toLowerCase();
-
-    // Get trade partner's data
-    let partnerLastLogin = null;
-    let ratingTheyGave = 0; // Rating the partner gave to us
-
-    if (partnerIsInitiator) {
-      // Partner is initiator, we are counterparty
-      partnerLastLogin = tradeData.Initiator?.LastLoginDate;
-      ratingTheyGave = tradeData.InitiatorRating; // Rating the initiator (partner) gave
-    } else if (partnerIsCounterparty) {
-      // Partner is counterparty, we are initiator
-      partnerLastLogin = tradeData.Counterparty?.LastLoginDate;
-      ratingTheyGave = tradeData.CounterpartyRating; // Rating the counterparty (partner) gave
-    }
-
-    // Remove any existing injected info to avoid duplicates
-    const existingInfo = container.querySelector(SELECTORS.PARTNER_INFO);
-    if (existingInfo) existingInfo.remove();
-
-    // Create info container
-    const infoDiv = document.createElement('div');
-    infoDiv.className = 'epack-partner-info';
-    Object.assign(infoDiv.style, {
-      display: 'inline-flex',
-      flexDirection: 'column',
-      alignItems: 'flex-start',
-      justifyContent: 'flex-start',
-      gap: '2px',
-      marginLeft: '16px',
-      fontSize: '12px',
-      color: '#666'
+    container.querySelector(SELECTORS.PARTNER_INFO)?.remove();
+    const div = document.createElement('div');
+    div.className = 'epack-partner-info';
+    Object.assign(div.style, {
+      display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-start',
+      gap: '2px', marginLeft: '16px', fontSize: '12px', color: '#666',
     });
-
-    // Add last login info
-    if (partnerLastLogin) {
-      const loginSpan = document.createElement('div');
-      loginSpan.textContent = `Last seen: ${formatRelativeTime(partnerLastLogin)}`;
-      infoDiv.appendChild(loginSpan);
+    if (lastLogin) {
+      const s = document.createElement('div');
+      s.textContent = `Last seen: ${formatRelativeTime(lastLogin)}`;
+      div.appendChild(s);
     }
-
-    // Add rating info (if they rated us)
-    if (ratingTheyGave > 0) {
-      const ratingSpan = document.createElement('div');
-      const stars = formatRatingStars(ratingTheyGave);
-      ratingSpan.innerHTML = `Rated you: <span style="color: #f39c12; font-size: 14px;">${stars}</span> <span style="color: #999;">(${ratingTheyGave}/5)</span>`;
-      infoDiv.appendChild(ratingSpan);
+    if (ratingGiven > 0) {
+      const s = document.createElement('div');
+      s.innerHTML = `Rated you: <span style="color:#f39c12;font-size:14px;">${formatRatingStars(ratingGiven)}</span> <span style="color:#999;">(${ratingGiven}/5)</span>`;
+      div.appendChild(s);
     }
-
-    // Only append if we have content
-    if (infoDiv.children.length > 0) {
-      container.appendChild(infoDiv);
-      return true;
-    }
-
+    if (div.children.length) { container.appendChild(div); return true; }
     return false;
   }
 
-  // ---------- DOM Monitoring ----------
-  /**
-   * Ensure partner info is present in the DOM, re-injecting if removed.
-   * Called regularly by polling and MutationObserver to handle React re-renders.
-   */
+  // ---------- DOM monitoring ----------
   async function ensurePartnerInfo() {
     if (state.isCheckingPartnerInfo) return;
     state.isCheckingPartnerInfo = true;
-
     try {
-      const partnerInfoExists = document.querySelector(SELECTORS.PARTNER_INFO);
       const container = document.querySelector(SELECTORS.PARTNER_CONTAINER);
-
-      if (!partnerInfoExists && container) {
-        const wasInjected = state.partnerInfoInjected;
-
-        try {
-          if (!state.cachedTradeData) {
-            state.cachedTradeData = await getTradeData();
-          }
-
-          if (state.cachedTradeData) {
-            const injected = injectTradePartnerInfo(state.cachedTradeData);
-            if (injected) {
-              state.partnerInfoInjected = true;
-            }
-          }
-        } catch (e) {
-          console.warn(LOG, 'Failed to inject info:', e);
-        }
-      } else if (partnerInfoExists && !state.partnerInfoInjected) {
-        state.partnerInfoInjected = true;
+      if (container && !document.querySelector(SELECTORS.PARTNER_INFO)) {
+        if (!state.cachedTradeData) state.cachedTradeData = await getTradeData();
+        if (state.cachedTradeData && injectTradePartnerInfo(state.cachedTradeData))
+          state.partnerInfoInjected = true;
       }
-    } finally {
-      state.isCheckingPartnerInfo = false;
-    }
+    } finally { state.isCheckingPartnerInfo = false; }
   }
 
-  /**
-   * Check if toolbar exists and mount if needed.
-   * Also ensures partner info is injected and maintained.
-   */
   async function checkAndMountToolbar() {
-    // Prevent concurrent execution
     if (state.isCheckingToolbar) return;
     state.isCheckingToolbar = true;
-
     try {
-      // Verify toolbar still exists in DOM
-      const anchor = document.getElementById(ANCHOR_ID);
+      const anchor  = document.getElementById(ANCHOR_ID);
       const toolbar = document.querySelector(SELECTORS.TOOLBAR);
-
       if (!anchor || !toolbar) {
-        // Toolbar was removed or never mounted
         if (state.toolbarMounted) {
-          state.toolbarMounted = false;
-          state.partnerInfoInjected = false;
-          state.cachedTradeData = null;
+          state.toolbarMounted = false; state.partnerInfoInjected = false;
+          state.cachedTradeData = null; _workerBadgeEl = null;
         }
-
-        const mounted = mountToolbarUnderTradeDetail();
-        if (mounted) {
+        if (mountToolbar()) {
           state.toolbarMounted = true;
-
-          // Wait a bit for DOM to settle before adding enhancements
           await delay(300);
-
-          // Add physical card indicators first
-          try {
-            await addPhysicalIndicators();
-          } catch (e) {
-            console.warn(LOG, 'Failed to add indicators:', e);
-          }
-
-          // Apply digital card styling
-          try {
-            await applyDigitalCardStyling();
-          } catch (e) {
-            console.warn(LOG, 'Failed to apply digital card styling:', e);
-          }
-
-          // Render totals (this may trigger React re-render)
-          try {
-            await renderTotals();
-          } catch (e) {
-            console.warn(LOG, 'Failed to render totals:', e);
-          }
-
-          // Inject trade partner info AFTER totals (to avoid being removed by React)
-          await delay(500); // Extra delay for React to settle
+          await addPhysicalIndicators().catch(() => {});
+          await applyDigitalCardStyling().catch(() => {});
+          await renderTotals().catch(() => {});
+          await delay(500);
           await ensurePartnerInfo();
         }
       } else {
-        // Toolbar exists
-        if (!state.toolbarMounted) {
-          state.toolbarMounted = true;
-        }
-
-        // Always check and ensure partner info is present
+        if (!state.toolbarMounted) state.toolbarMounted = true;
         await ensurePartnerInfo();
       }
-    } finally {
-      state.isCheckingToolbar = false;
-    }
+    } finally { state.isCheckingToolbar = false; }
   }
 
-  /**
-   * Setup MutationObserver to detect DOM changes and maintain UI elements.
-   * Monitors toolbar presence and partner info injection.
-   */
   function setupMutationObserver() {
-    const observer = new MutationObserver(() => {
-      if (state.isCheckingToolbar) return; // Prevent concurrent checks
-
+    const obs = new MutationObserver(() => {
+      if (state.isCheckingToolbar) return;
       const hasHeader = document.querySelector(SELECTORS.TRADE_HEADER);
-      const anchor = document.getElementById(ANCHOR_ID);
-      const toolbar = document.querySelector(SELECTORS.TOOLBAR);
-
-      // Case 1: Header exists but toolbar is missing (mount or remount needed)
-      if (hasHeader && (!anchor || !toolbar)) {
-        checkAndMountToolbar();
-        return;
-      }
-
-      // Case 2: Check if partner info was removed (React re-render) and immediately re-inject
+      const anchor    = document.getElementById(ANCHOR_ID);
+      const toolbar   = document.querySelector(SELECTORS.TOOLBAR);
+      if (hasHeader && (!anchor || !toolbar)) { checkAndMountToolbar(); return; }
       if (state.toolbarMounted && anchor && toolbar) {
-        const partnerInfoExists = document.querySelector(SELECTORS.PARTNER_INFO);
         const container = document.querySelector(SELECTORS.PARTNER_CONTAINER);
-        if (!partnerInfoExists && container && !state.isCheckingPartnerInfo) {
+        if (container && !document.querySelector(SELECTORS.PARTNER_INFO) && !state.isCheckingPartnerInfo)
           ensurePartnerInfo();
-        }
       }
     });
-
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true
-    });
-
-    // Store observer for cleanup
-    state.mutationObserver = observer;
+    obs.observe(document.body, { childList: true, subtree: true });
+    state.mutationObserver = obs;
   }
 
-  /**
-   * Cleanup function to disconnect observers and intervals.
-   * Called on page unload.
-   */
   function cleanup() {
-    if (state.mutationObserver) {
-      state.mutationObserver.disconnect();
-      state.mutationObserver = null;
-    }
-    if (state.pollingInterval) {
-      clearInterval(state.pollingInterval);
-      state.pollingInterval = null;
-    }
+    state.mutationObserver?.disconnect(); state.mutationObserver = null;
+    clearInterval(state.pollingInterval);  state.pollingInterval  = null;
   }
 
-  /**
-   * Initialize the userscript.
-   * Sets up observers, mounts toolbar, and starts monitoring.
-   */
   function initialize() {
-    // Setup MutationObserver for dynamic page changes
     setupMutationObserver();
-
-    // Initial mount attempt - wait for React to settle
     setTimeout(() => checkAndMountToolbar(), 500);
-
-    // Polling every 2 seconds as backup (MutationObserver handles most cases)
     state.pollingInterval = setInterval(() => {
-      if (!state.isCheckingToolbar) {
-        checkAndMountToolbar();
-      }
+      if (!state.isCheckingToolbar) checkAndMountToolbar();
     }, TOOLBAR_CHECK_MS);
-
-    // Cleanup on page unload
     window.addEventListener('beforeunload', cleanup);
   }
 
-  // Initialize immediately - @run-at document-idle ensures DOM is ready
   initialize();
-
 })();
