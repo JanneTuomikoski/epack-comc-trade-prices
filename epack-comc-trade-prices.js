@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ePack Trade COMC price check
 // @namespace    epack-comc-trade-prices
-// @version      1.8.0
+// @version      1.9.0
 // @description  Fetch COMC prices via a comc.com worker tab. Keep one comc.com tab open — no proxy needed.
 // @match        https://www.upperdeckepack.com/*
 // @match        https://www.comc.com/*
@@ -93,6 +93,8 @@
     PHYSICAL_INDICATOR:'.epack-physical-indicator',
     PARTNER_INFO:      '.epack-partner-info',
     TRADE_EDIT_BUTTONS:'.trade-edit-buttons',
+    PRICE_BTN:         '.epack-price-btn',
+    LIST_ROW:          '.list-view-row',
   };
 
   const TIME = {
@@ -434,6 +436,11 @@
       let t = `COMC: $${getDisplayPrice(raw).toFixed(2)}`;
       if (chip.dataset.isPhysical === 'false') t += ' 💿';
       chip.textContent = t;
+    });
+    document.querySelectorAll(SELECTORS.PRICE_BTN).forEach(btn => {
+      const raw = parseFloat(btn.dataset.rawPrice);
+      if (isNaN(raw)) return;
+      btn.textContent = `$${getDisplayPrice(raw).toFixed(2)}`;
     });
     await renderTotals();
   }
@@ -868,6 +875,7 @@
         if (container && !document.querySelector(SELECTORS.PARTNER_INFO) && !state.isCheckingPartnerInfo)
           ensurePartnerInfo();
       }
+      if (!hasHeader && document.querySelector(SELECTORS.LIST_ROW)) scanListViewRows();
     });
     obs.observe(document.body, { childList: true, subtree: true });
     state.mutationObserver = obs;
@@ -878,11 +886,157 @@
     clearInterval(state.pollingInterval);  state.pollingInterval  = null;
   }
 
+  // ============================================================
+  // COLLECTION / LISTING PAGE  (per-card price icons)
+  // ============================================================
+
+  function isTradeDetailPage() {
+    return !!document.querySelector(SELECTORS.TRADE_HEADER);
+  }
+
+  function extractCardMetaFromListRow(row) {
+    const nameCol    = row.querySelector('.card-name');
+    // Read name from a dedicated span if injected, otherwise raw text node
+    const player     = clean(
+      nameCol?.querySelector('.epack-card-name-text')?.textContent ||
+      Array.from(nameCol?.childNodes || []).filter(n => n.nodeType === 3).map(n => n.textContent).join('') ||
+      nameCol?.textContent || ''
+    );
+    // Read number from a dedicated span if injected, otherwise raw numCol text
+    const numCol     = row.querySelector('.row.py-0.align-items-center .col-1.text-right');
+    const number     = clean(numCol?.querySelector('.epack-card-num')?.textContent || numCol?.textContent || '');
+    const insertName = clean(row.closest('.group')?.querySelector('.group-header')?.textContent || '');
+    if (!player || !insertName) return null;
+    return { player, insertName, number, isPhysical: true, isTransferable: false,
+             query: buildQuery({ player, insertName, number }) };
+  }
+
+  async function handleListRowPriceClick(row, btn) {
+    if (btn.dataset.loading) return;
+    btn.dataset.loading = '1';
+    btn.textContent = '⏳';
+    btn.title = 'Fetching…';
+    btn.style.pointerEvents = 'none';
+
+    try {
+      await ensureWorkerChecked();
+      if (!worker.alive) {
+        btn.textContent = '⚠';
+        btn.title = 'Open a comc.com tab in Chrome (with the script installed), then try again.';
+        btn.style.color = '#856404';
+        return;
+      }
+
+      const meta = extractCardMetaFromListRow(row);
+      if (!meta?.query) {
+        btn.textContent = '?';
+        btn.title = 'Cannot read card data from this row.';
+        return;
+      }
+
+      let cached = getCached(meta.query);
+      if (!cached) {
+        const resp = await fetchSearchHtml(meta.query);
+        if (!resp.ok) {
+          btn.textContent = '✗';
+          btn.title = resp.workerOffline
+            ? 'Worker offline — open a comc.com tab and try again.'
+            : (resp.error || `HTTP ${resp.status}`);
+          btn.style.color = '#721c24';
+          return;
+        }
+        const { items, counts } = parseSearch(resp.html);
+        const cheapest = items.length ? items.slice().sort((a, b) => a.price - b.price)[0] : null;
+        const link     = cheapest?.link || comcSearchUrl(meta.query);
+        const tooltip  = cheapest?.quantity != null
+          ? `${cheapest.quantity} available on COMC`
+          : `${counts.nonAuctionTotal} listings on COMC`;
+        setCached(meta.query, { price: cheapest?.price ?? null, link, tooltip });
+        cached = getCached(meta.query);
+      }
+
+      const rawPrice = cached?.price ?? null;
+      const link     = cached?.link   || comcSearchUrl(meta.query);
+      const tooltip  = cached?.tooltip || '';
+
+      if (rawPrice != null) {
+        btn.dataset.rawPrice = String(rawPrice);
+        btn.textContent = `$${getDisplayPrice(rawPrice).toFixed(2)}`;
+        btn.title = (tooltip ? tooltip + '\n' : '') + 'Click to view on COMC';
+        btn.style.color = '#155724';
+        btn.style.fontWeight = '700';
+        btn.onclick = e => { e.stopPropagation(); window.open(link, '_blank'); };
+      } else {
+        btn.textContent = '—';
+        btn.title = (tooltip ? tooltip + '\n' : '') + 'Not found on COMC (click to search)';
+        btn.style.color = '#555';
+        btn.onclick = e => { e.stopPropagation(); window.open(link, '_blank'); };
+      }
+    } finally {
+      delete btn.dataset.loading;
+      btn.style.pointerEvents = '';
+    }
+  }
+
+  function injectListRowPriceBtn(row) {
+    const headerRow = row.querySelector('.row.py-0.align-items-center');
+    if (!headerRow) return;
+    if (headerRow.querySelector(SELECTORS.PRICE_BTN)) return;
+
+    // Inject into the card number column — wrap existing number in a span first
+    const numCol = headerRow.querySelector('.col-1.text-right');
+    if (!numCol) return;
+
+    const numText = numCol.textContent.trim();
+    numCol.textContent = '';
+    const numSpan = document.createElement('span');
+    numSpan.className = 'epack-card-num';
+    numSpan.textContent = numText;
+
+    const btn = document.createElement('div');
+    btn.className = 'epack-price-btn';
+    btn.textContent = '$';
+    btn.title = 'Check COMC price';
+    Object.assign(btn.style, {
+      fontSize: '14px', fontWeight: '600', cursor: 'pointer', letterSpacing: '0.5px',
+      padding: '1px 5px', borderRadius: '4px', border: '1px solid #bbb',
+      background: '#f4f4f4', color: '#333', display: 'inline-block',
+      lineHeight: '1.5', userSelect: 'none', whiteSpace: 'nowrap',
+    });
+    btn.onclick = e => { e.stopPropagation(); handleListRowPriceClick(row, btn); };
+
+    numCol.style.display = 'flex';
+    numCol.style.flexDirection = 'row';
+    numCol.style.alignItems = 'center';
+    numCol.style.justifyContent = 'space-between';
+    numCol.style.gap = '16px';
+    numCol.appendChild(btn);
+    numCol.appendChild(numSpan);
+  }
+
+  function isListRowPhysical(row) {
+    const headerRow = row.querySelector('.row.py-0.align-items-center');
+    if (!headerRow) return false;
+    const physEl = headerRow.querySelector('.physical-item');
+    return physEl ? physEl.textContent.includes('✓') : false;
+  }
+
+  function scanListViewRows() {
+    document.querySelectorAll(SELECTORS.LIST_ROW).forEach(row => {
+      if (!isListRowPhysical(row)) return;
+      const headerRow = row.querySelector('.row.py-0.align-items-center');
+      if (!headerRow || headerRow.querySelector(SELECTORS.PRICE_BTN)) return;
+      injectListRowPriceBtn(row);
+    });
+  }
+
   function initialize() {
     setupMutationObserver();
     setTimeout(() => checkAndMountToolbar(), 500);
+    setTimeout(() => scanListViewRows(), 600);
     state.pollingInterval = setInterval(() => {
       if (!state.isCheckingToolbar) checkAndMountToolbar();
+      if (!isTradeDetailPage()) scanListViewRows();
     }, TOOLBAR_CHECK_MS);
     window.addEventListener('beforeunload', cleanup);
   }
