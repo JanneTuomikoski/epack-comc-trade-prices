@@ -20,6 +20,10 @@ Built with Claude Sonnet 4.6
 - **Quantity Display**: Show number of available cards on COMC (tooltip)
 - **COMC Fee Toggle**: Toolbar toggle to include or exclude the $0.50 COMC sales fee from all displayed prices — preference is persisted per-browser and prices update instantly without re-fetching
 
+### Collection Page Improvements
+- **COMC Price Button**: Each physical card row in the collection listing gets a `$` button next to the card number. Click it to fetch the current COMC price on demand — no need to open a trade first. Requires a comc.com tab open in the background (same as trade pricing)
+- **Silent Transfer**: Clicking the Transfer Item button on the collection listing page no longer reloads or clears the page. The card is added to your transfer basket silently — the expanded row stays open, scroll position is preserved, and the transfer cart badge in the nav updates immediately
+
 ![Card details](https://github.com/user-attachments/assets/f5f53f6a-3d9f-490d-9e59-64276752cc73)
 
 ### Trade Partner Information

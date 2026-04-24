@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ePack Trade COMC price check
 // @namespace    epack-comc-trade-prices
-// @version      1.9.0
+// @version      1.9.6
 // @description  Fetch COMC prices via a comc.com worker tab. Keep one comc.com tab open — no proxy needed.
 // @match        https://www.upperdeckepack.com/*
 // @match        https://www.comc.com/*
@@ -1028,6 +1028,55 @@
       if (!headerRow || headerRow.querySelector(SELECTORS.PRICE_BTN)) return;
       injectListRowPriceBtn(row);
     });
+  }
+
+  // ---------- Silent transfer (Collection page only) ----------
+  // Intercept .side-btn-transfer clicks in capture phase so React never sees them.
+  // React's handlers run in bubble phase on document — capture fires first, letting us
+  // call stopImmediatePropagation() before any Redux dispatch (and any DOM clearing) happens.
+  if (location.pathname.startsWith('/Collection')) {
+    document.addEventListener('click', function(e) {
+      const btn = e.target.closest('.side-btn-transfer');
+      if (!btn) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
+      let inventoryCardId = null;
+      try {
+        const instKey = Object.keys(btn).find(k => k.startsWith('__reactInternalInstance'));
+        const owner = btn[instKey]?._currentElement?._owner;
+        inventoryCardId = owner?._instance?.props?.instance?.InventoryCardID ?? null;
+      } catch (ex) { /* ignore */ }
+
+      if (!inventoryCardId) {
+        console.warn(LOG, 'silent transfer: could not read InventoryCardID');
+        return;
+      }
+
+      btn.style.opacity = '0.4';
+      fetch('/api/transfer/AddToTransferCart', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify([inventoryCardId]),
+      }).then(r => {
+        btn.style.opacity = '';
+        if (r.ok) {
+          const img = btn.closest('.side-btn-items')?.previousElementSibling?.querySelector('.product-card-display')
+                   ?? btn.closest('[data-card-template]');
+          if (img) img.style.opacity = '0.25';
+          const meatball = Array.from(document.querySelectorAll('.js-transfer-cart-icon i.ud-transfer, i.ud-transfer'))
+            .find(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+          if (meatball) meatball.dataset.meatballAlert = String(Number(meatball.dataset.meatballAlert || 0) + 1);
+          console.info(LOG, 'silent transfer OK', inventoryCardId);
+        } else {
+          console.warn(LOG, 'silent transfer HTTP', r.status);
+        }
+      }).catch(err => {
+        btn.style.opacity = '';
+        console.error(LOG, 'silent transfer error', err);
+      });
+    }, true);
   }
 
   function initialize() {
