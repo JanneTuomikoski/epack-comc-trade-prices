@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ePack Trade COMC price check
 // @namespace    epack-comc-trade-prices
-// @version      1.9.6
+// @version      1.9.7
 // @description  Fetch COMC prices via a comc.com worker tab. Keep one comc.com tab open — no proxy needed.
 // @match        https://www.upperdeckepack.com/*
 // @match        https://www.comc.com/*
@@ -1035,6 +1035,8 @@
   // React's handlers run in bubble phase on document — capture fires first, letting us
   // call stopImmediatePropagation() before any Redux dispatch (and any DOM clearing) happens.
   if (location.pathname.startsWith('/Collection')) {
+    const _transferredIds = new Set();
+
     document.addEventListener('click', function(e) {
       const btn = e.target.closest('.side-btn-transfer');
       if (!btn) return;
@@ -1053,6 +1055,11 @@
         return;
       }
 
+      if (_transferredIds.has(inventoryCardId)) {
+        console.info(LOG, 'silent transfer: already transferred', inventoryCardId);
+        return;
+      }
+
       btn.style.opacity = '0.4';
       fetch('/api/transfer/AddToTransferCart', {
         method: 'POST',
@@ -1065,6 +1072,8 @@
           const img = btn.closest('.side-btn-items')?.previousElementSibling?.querySelector('.product-card-display')
                    ?? btn.closest('[data-card-template]');
           if (img) img.style.opacity = '0.25';
+          _transferredIds.add(inventoryCardId);
+          btn.style.pointerEvents = 'none';
           const meatball = Array.from(document.querySelectorAll('.js-transfer-cart-icon i.ud-transfer, i.ud-transfer'))
             .find(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
           if (meatball) meatball.dataset.meatballAlert = String(Number(meatball.dataset.meatballAlert || 0) + 1);
